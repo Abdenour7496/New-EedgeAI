@@ -41,18 +41,14 @@
   "agents": {
     "defaults": {
       "model": {
-        "primary": "github-copilot/gpt-4.1",
+        "primary": "github-copilot/gpt-5.4-mini",
         "fallbacks": [
-          "github-copilot/gpt-5.4",
           "ollama/llama3.2:latest"
         ]
       },
       "models": {
-        "github-copilot/gpt-5.4": {
+        "github-copilot/gpt-5.4-mini": {
           "alias": "copilot"
-        },
-        "github-copilot/gpt-4.1": {
-          "alias": "gpt-4.1"
         },
         "ollama/llama3.2:latest": {
           "alias": "local"
@@ -65,7 +61,7 @@
         "outputDimensionality": 768
       },
       "heartbeat": {
-        "model": "github-copilot/gpt-4.1"
+        "model": "ollama/llama3.2:latest"
       }
     }
   },

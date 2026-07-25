@@ -1,7 +1,11 @@
 # Environment / secrets — never commit
 .env
 .env.*
+.env copy
 !.env.example
+
+# Local backups
+backups/
 
 # Archives
 *.zip

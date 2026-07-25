@@ -47,12 +47,15 @@ Retrieval flow for every /v1/chat/completions request
 
 Other endpoints
 ───────────────
-  GET  /v1/models      → live OpenAI model list (with fallback)
-  POST /v1/embeddings  → proxied to OpenAI
-  GET  /health         → liveness check
+  GET  /v1/models              → live OpenAI model list (with fallback)
+  POST /v1/embeddings          → proxied to OpenAI
+  POST /v1/buzz/chat/completions → bearer-authenticated GCOR entry point for the
+                                    Buzz collaboration bridge (see BUZZ_BRIDGE_API_KEY)
+  GET  /health                 → liveness check
 """
 
 import hashlib
+import hmac
 import io
 import json
 import logging
@@ -202,6 +205,110 @@ ENABLE_RAG = os.getenv("ENABLE_RAG", "true").lower() in ("true", "1", "yes")
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.0"))
 # Agent id scopes memory/belief/inference retrieval to a single partition
 AGENT_ID = os.getenv("AGENT_ID", "")
+
+# ── Buzz bridge (optional --profile buzz integration) ─────────────────────────
+# Shared secret the buzz-agent-bridge container presents on /v1/buzz/chat/completions.
+# That route is reachable from the Buzz relay's channel traffic (humans + agents),
+# a less-trusted source than the internal-network-only /v1/chat/completions, so it
+# is closed (503) unless this is explicitly set.
+BUZZ_BRIDGE_API_KEY = os.getenv("BUZZ_BRIDGE_API_KEY", "")
+# Optional allowlist restricting which collections Buzz-originated queries may target.
+# Empty = no restriction beyond what /v1/chat/completions already allows.
+BUZZ_ALLOWED_COLLECTIONS = [
+    c.strip() for c in os.getenv("BUZZ_ALLOWED_COLLECTIONS", "").split(",") if c.strip()
+]
+BUZZ_BRIDGE_RATE_LIMIT = int(os.getenv("BUZZ_BRIDGE_RATE_LIMIT_PER_MIN", "30"))
+# buzz-acp bundles base prompt + up to BUZZ_ACP_CONTEXT_MESSAGE_LIMIT prior
+# messages + memory injection into a single message, easily tens of KB —
+# 8000 chars (initial guess) was too tight for real traffic and rejected
+# legitimate turns outright.
+BUZZ_BRIDGE_MAX_MESSAGE_CHARS = int(os.getenv("BUZZ_BRIDGE_MAX_MESSAGE_CHARS", "100000"))
+# Cap on /v1/buzz/ingest uploads — this route is reachable from Buzz channel
+# content (an image attachment or a storage_key lookup), so unlike the
+# internal-network-only /api/ingest it needs its own size ceiling.
+BUZZ_BRIDGE_MAX_UPLOAD_BYTES = int(os.getenv("BUZZ_BRIDGE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
+
+# ── Document storage (MinIO, S3-compatible) ───────────────────────────────────
+# Best-effort: ingestion still works if MinIO is unreachable or unconfigured,
+# it just skips persisting the original file.
+S3_ENDPOINT_URL      = os.getenv("S3_ENDPOINT_URL", "http://minio:9000")
+S3_ACCESS_KEY        = os.getenv("S3_ACCESS_KEY", "")
+S3_SECRET_KEY        = os.getenv("S3_SECRET_KEY", "")
+S3_BUCKET            = os.getenv("S3_BUCKET", "documents")
+S3_ORIGINALS_PREFIX  = os.getenv("S3_ORIGINALS_PREFIX", "originals/")
+
+_s3_client = None
+_s3_client_init = False
+
+
+def _get_s3_client():
+    """Lazily construct the boto3 S3 client (MinIO). Returns None if unconfigured."""
+    global _s3_client, _s3_client_init
+    if not _s3_client_init:
+        _s3_client_init = True
+        if S3_ACCESS_KEY and S3_SECRET_KEY:
+            import boto3
+            from botocore.client import Config as BotoConfig
+            _s3_client = boto3.client(
+                "s3",
+                endpoint_url=S3_ENDPOINT_URL,
+                aws_access_key_id=S3_ACCESS_KEY,
+                aws_secret_access_key=S3_SECRET_KEY,
+                config=BotoConfig(signature_version="s3v4"),
+                region_name="us-east-1",
+            )
+    return _s3_client
+
+
+async def _store_original_to_s3(doc_id: str, filename: str, data: bytes) -> str | None:
+    """Persist the raw uploaded file to MinIO. Returns the object key, or None on failure/unconfigured."""
+    client = _get_s3_client()
+    if client is None:
+        return None
+    key = f"{S3_ORIGINALS_PREFIX}{doc_id}/{filename}"
+    try:
+        await asyncio.to_thread(client.put_object, Bucket=S3_BUCKET, Key=key, Body=data)
+        return key
+    except Exception as exc:
+        logger.warning("S3 store of original file failed (doc_id=%s): %s", doc_id, exc)
+        return None
+
+
+async def _find_and_fetch_from_s3(name: str) -> tuple[bytes | None, str | None]:
+    """Look up a file by bare name or key across the documents bucket's known
+    locations: exact key, inbox/, processed/, failed/, and originals/<doc_id>/
+    (doc_id unknown, so that one is a suffix match). Returns (bytes, filename)
+    or (None, None) if not found or S3 isn't configured."""
+    client = _get_s3_client()
+    if client is None:
+        return None, None
+
+    def _try_get(key: str):
+        try:
+            return client.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
+        except Exception:
+            return None
+
+    for prefix in ("", "inbox/", "processed/", "failed/"):
+        data = await asyncio.to_thread(_try_get, f"{prefix}{name}")
+        if data is not None:
+            return data, name.rsplit("/", 1)[-1]
+
+    def _search_originals() -> str | None:
+        paginator = client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=S3_ORIGINALS_PREFIX):
+            for obj in page.get("Contents", []):
+                if obj["Key"].endswith(f"/{name}"):
+                    return obj["Key"]
+        return None
+
+    match_key = await asyncio.to_thread(_search_originals)
+    if match_key:
+        data = await asyncio.to_thread(_try_get, match_key)
+        if data is not None:
+            return data, name
+
+    return None, None
 
 
 # ── Step 1: Intent classification ─────────────────────────────────────────────
@@ -440,37 +547,56 @@ RAG_EXTRA_COLLECTIONS = [
 ]
 
 
-async def qdrant_search(vector: list) -> list:
-    """Search primary + extra RAG collections, fuse by normalised cosine score.
+def _request_rag_collection(body: dict, request: Request) -> str | None:
+    """Return an optional collection selected by an OpenWebUI workspace filter."""
+    body_collection = body.pop("gcor_collection", None)
+    requested = request.headers.get("X-GCOR-Collection") or body_collection
+    if requested is None:
+        return None
+    if not isinstance(requested, str):
+        raise HTTPException(status_code=400, detail="gcor_collection must be a string")
+
+    collection = requested.strip()
+    if not collection:
+        return None
+    if len(collection) > 255 or any(char in collection for char in "/\\?#"):
+        raise HTTPException(status_code=400, detail="Invalid gcor_collection")
+    return collection
+
+
+async def qdrant_search(vector: list, collection: str | None = None) -> list:
+    """Search one selected collection or the default collection set.
 
     Each collection's scores are min-max normalised to [0, 1] before merging
     so that differences in corpus size or score distributions don't bias results.
     The top QDRANT_TOP_K results across all collections are returned.
     """
     embed_dim = len(vector)
-    collections = [QDRANT_COLLECTION]
+    collections = [collection or QDRANT_COLLECTION]
 
-    # Discover which extra collections have matching dimensions
+    # A workspace-selected collection is an explicit scope. Default requests
+    # retain the existing behavior of searching configured extra collections.
     async with httpx.AsyncClient(timeout=10) as c:
-        for name in RAG_EXTRA_COLLECTIONS:
-            if name == QDRANT_COLLECTION:
-                continue
-            try:
-                info = await c.get(f"{QDRANT_URL}/collections/{name}")
-                if info.status_code != 200:
+        if collection is None:
+            for name in RAG_EXTRA_COLLECTIONS:
+                if name == QDRANT_COLLECTION:
                     continue
-                col_dim = (info.json().get("result", {})
-                           .get("config", {}).get("params", {})
-                           .get("vectors", {}).get("size"))
-                if col_dim == embed_dim:
-                    collections.append(name)
-                else:
-                    logger.debug(
-                        "Skipping collection '%s': dim %s != embed dim %s",
-                        name, col_dim, embed_dim,
-                    )
-            except Exception:
-                pass
+                try:
+                    info = await c.get(f"{QDRANT_URL}/collections/{name}")
+                    if info.status_code != 200:
+                        continue
+                    col_dim = (info.json().get("result", {})
+                               .get("config", {}).get("params", {})
+                               .get("vectors", {}).get("size"))
+                    if col_dim == embed_dim:
+                        collections.append(name)
+                    else:
+                        logger.debug(
+                            "Skipping collection '%s': dim %s != embed dim %s",
+                            name, col_dim, embed_dim,
+                        )
+                except Exception:
+                    pass
 
         # Search all matching collections concurrently
         per_col = max(QDRANT_TOP_K, 12)  # fetch extra so normalisation is stable
@@ -1615,7 +1741,130 @@ async def embeddings(request: Request):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    body     = await request.json()
+    body = await request.json()
+    rag_collection = _request_rag_collection(body, request)
+    return await _run_chat_completion(body, rag_collection)
+
+
+# ── Buzz bridge ──────────────────────────────────────────────────────────────
+# In-process sliding-window limiter — the Buzz bridge is a single trusted
+# caller, this just bounds cost/blast-radius if its token ever leaks or the
+# bridge misbehaves (e.g. a workflow loop re-triggering itself).
+_buzz_rate_lock: "asyncio.Lock | None" = None
+_buzz_rate_window: list[float] = []
+
+
+async def _check_buzz_rate_limit():
+    global _buzz_rate_lock
+    if _buzz_rate_lock is None:
+        _buzz_rate_lock = asyncio.Lock()
+    now = time.monotonic()
+    async with _buzz_rate_lock:
+        while _buzz_rate_window and now - _buzz_rate_window[0] > 60:
+            _buzz_rate_window.pop(0)
+        if len(_buzz_rate_window) >= BUZZ_BRIDGE_RATE_LIMIT:
+            raise HTTPException(status_code=429, detail="Buzz bridge rate limit exceeded")
+        _buzz_rate_window.append(now)
+
+
+@app.post("/v1/buzz/chat/completions")
+async def buzz_chat_completions(request: Request):
+    """Bearer-authenticated GCOR entry point for the Buzz collaboration bridge.
+
+    Buzz channel content (human or agent authored) is a less-trusted source than
+    the rest of the internal docker network, so this route is separate from
+    /v1/chat/completions: it requires BUZZ_BRIDGE_API_KEY, caps message size,
+    optionally restricts which collection may be queried, and rate-limits.
+    """
+    if not BUZZ_BRIDGE_API_KEY:
+        raise HTTPException(status_code=503, detail="Buzz bridge is not configured")
+
+    auth = request.headers.get("authorization", "")
+    scheme, _, token = auth.partition(" ")
+    if scheme.lower() != "bearer" or not hmac.compare_digest(token, BUZZ_BRIDGE_API_KEY):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    await _check_buzz_rate_limit()
+
+    body = await request.json()
+    messages = body.get("messages", [])
+    if not isinstance(messages, list) or not messages or len(messages) > 50:
+        raise HTTPException(status_code=400, detail="Invalid messages")
+    for m in messages:
+        content = m.get("content", "") if isinstance(m, dict) else None
+        # Same two shapes last_user_text() already tolerates: a plain string, or
+        # OpenAI-style content-part blocks ([{"type": "text", "text": "..."}]) —
+        # buzz-agent's OpenAI-compat client sends the latter.
+        if isinstance(content, str):
+            text_len = len(content)
+        elif isinstance(content, list):
+            text_len = sum(
+                len(p.get("text", "")) for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        else:
+            raise HTTPException(status_code=400, detail="Invalid message content")
+        if text_len > BUZZ_BRIDGE_MAX_MESSAGE_CHARS:
+            raise HTTPException(status_code=400, detail="Message content too long")
+
+    rag_collection = _request_rag_collection(body, request)
+    if BUZZ_ALLOWED_COLLECTIONS and rag_collection not in (None, *BUZZ_ALLOWED_COLLECTIONS):
+        raise HTTPException(status_code=403, detail="Collection not permitted for Buzz bridge")
+
+    body = {**body, "model": "openclaw"}  # always answer via the GCOR pipeline, ignore caller-supplied model
+    return await _run_chat_completion(body, rag_collection)
+
+
+@app.post("/v1/buzz/ingest")
+async def buzz_ingest(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    file: UploadFile | None = File(None),
+    storage_key: str = Form(""),
+):
+    """Buzz-facing document ingestion — same trust boundary and auth as
+    /v1/buzz/chat/completions (BUZZ_BRIDGE_API_KEY, shared rate limit).
+
+    Two ways in, both used by the bridge:
+      - multipart file upload — an image attachment pulled off a Buzz message
+        (Buzz's own media pipeline only accepts images, so this is the only
+        binary content a channel can actually produce).
+      - storage_key — ingest (or re-confirm) a file that's already sitting in
+        MinIO under documents/inbox/, processed/, failed/, or originals/*/,
+        for the '@bot ingest <name>' text-reference path.
+    """
+    if not BUZZ_BRIDGE_API_KEY:
+        raise HTTPException(status_code=503, detail="Buzz bridge is not configured")
+
+    auth = request.headers.get("authorization", "")
+    scheme, _, token = auth.partition(" ")
+    if scheme.lower() != "bearer" or not hmac.compare_digest(token, BUZZ_BRIDGE_API_KEY):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    await _check_buzz_rate_limit()
+
+    if file is not None:
+        data = await file.read()
+        filename = file.filename or "upload"
+    elif storage_key.strip():
+        data, filename = await _find_and_fetch_from_s3(storage_key.strip())
+        if data is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"'{storage_key}' not found in MinIO (checked bucket root, inbox/, processed/, failed/, originals/*)",
+            )
+    else:
+        raise HTTPException(status_code=400, detail="Provide either a file or storage_key")
+
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if len(data) > BUZZ_BRIDGE_MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="File too large")
+
+    return await _ingest_bytes(filename, data, background_tasks=background_tasks, enable_docint=True)
+
+
+async def _run_chat_completion(body: dict, rag_collection: str | None):
     messages = list(body.get("messages", []))
 
     rag_intent   = "none"
@@ -1633,7 +1882,7 @@ async def chat_completions(request: Request):
 
             # ── Step 2a: Semantic (Qdrant → element IDs) ────────────────────
             vector      = await embed_text(query)
-            raw_hits    = await qdrant_search(vector) if vector else []
+            raw_hits    = await qdrant_search(vector, rag_collection) if vector else []
             qdrant_hits = _filter_hits(raw_hits)
             element_ids = [
                 h["payload"]["neo4j_element_id"]
@@ -1642,8 +1891,8 @@ async def chat_completions(request: Request):
             ]
             METRIC_QDRANT_HITS.observe(len(qdrant_hits))
             logger.info(
-                "Qdrant: %d raw → %d after cognitive filters, %d with neo4j_element_id",
-                len(raw_hits), len(qdrant_hits), len(element_ids),
+                "Qdrant[%s]: %d raw → %d after cognitive filters, %d with neo4j_element_id",
+                rag_collection or "default", len(raw_hits), len(qdrant_hits), len(element_ids),
             )
 
             # ── Step 2b: Structural (Neo4j graph expansion) ─────────────────
@@ -2477,22 +2726,21 @@ async def api_search(
     return {"collection": collection, "query": q, "results": results}
 
 
-@app.post("/api/ingest")
-async def api_ingest(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    title: str = Form(""),
-    agent_id: str = Form(""),
-    access_level: str = Form("public"),
-    enable_docint: str = Form("false"),   # "true" → run full Document Intelligence
-    collection: str = Form(""),           # target Qdrant collection (defaults to QDRANT_COLLECTION)
-    valid_hours: float = Form(0.0),       # >0 → chunk expires after this many hours
-):
-    """JSON-returning ingest endpoint used by the knowledge UI."""
-    filename    = file.filename or "upload"
-    data        = await file.read()
-    use_docint  = enable_docint.lower() in ("true", "1", "yes")
-
+async def _ingest_bytes(
+    filename: str,
+    data: bytes,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+    title: str = "",
+    agent_id: str = "",
+    access_level: str = "public",
+    enable_docint: bool = False,
+    collection: str = "",
+    valid_hours: float = 0.0,
+) -> dict:
+    """Core ingest pipeline shared by every entry point: extract -> chunk ->
+    Neo4j -> Qdrant, plus a best-effort original-file copy to MinIO.
+    Raises HTTPException on failure."""
     if not data:
         raise HTTPException(status_code=400, detail="Empty file")
 
@@ -2505,13 +2753,15 @@ async def api_ingest(
     image_props: dict = {}
     docint_summary: dict = {}
 
+    storage_key = await _store_original_to_s3(doc_id, filename, data)
+
     try:
         if ext in _MEDICAL_EXTS or _is_image(ext):
             # Medical and image formats always use their dedicated handlers —
             # DocInt pipeline does not understand DICOM/NIfTI/pixel data.
             text, image_props = await _extract_image_text(filename, data, ext)
             text = text.strip()
-        elif use_docint:
+        elif enable_docint:
             # Full Document Intelligence pipeline (PDFs, DOCX, scanned docs)
             result: DocIntelResult = await process_document(filename, data)
             text        = result.to_rich_text().strip()
@@ -2545,14 +2795,18 @@ async def api_ingest(
         raise HTTPException(status_code=422, detail="No chunks produced")
     target_collection = collection.strip() or QDRANT_COLLECTION
 
+    if storage_key:
+        image_props["storage_bucket"] = S3_BUCKET
+        image_props["storage_key"] = storage_key
+
     from datetime import timedelta
     valid_to = (
         (datetime.now(timezone.utc) + timedelta(hours=valid_hours)).isoformat()
         if valid_hours > 0 else None
     )
     logger.info(
-        "API ingest '%s': %d chunks (ext=%s, docint=%s, collection=%s, valid_to=%s)",
-        doc_title, len(chunks), ext, use_docint, target_collection, valid_to,
+        "Ingest '%s': %d chunks (ext=%s, docint=%s, collection=%s, valid_to=%s)",
+        doc_title, len(chunks), ext, enable_docint, target_collection, valid_to,
     )
 
     try:
@@ -2584,7 +2838,8 @@ async def api_ingest(
     METRIC_INGEST_CHUNKS.observe(len(chunks))
 
     # NER entity extraction runs in the background so ingest response is immediate
-    background_tasks.add_task(_neo4j_create_mentions, chunk_eids, chunks)
+    if background_tasks is not None:
+        background_tasks.add_task(_neo4j_create_mentions, chunk_eids, chunks)
 
     result_json = {"status": "ok", "document_id": doc_id, "title": doc_title,
                    "filename": filename, "chunks": len(chunks), "qdrant_points": upserted,
@@ -2595,7 +2850,32 @@ async def api_ingest(
         result_json["image_metadata"] = image_props
     if docint_summary:
         result_json["docint"] = docint_summary
+    if storage_key:
+        result_json["storage"] = {"bucket": S3_BUCKET, "key": storage_key}
     return result_json
+
+
+@app.post("/api/ingest")
+async def api_ingest(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    title: str = Form(""),
+    agent_id: str = Form(""),
+    access_level: str = Form("public"),
+    enable_docint: str = Form("false"),   # "true" → run full Document Intelligence
+    collection: str = Form(""),           # target Qdrant collection (defaults to QDRANT_COLLECTION)
+    valid_hours: float = Form(0.0),       # >0 → chunk expires after this many hours
+):
+    """JSON-returning ingest endpoint used by the knowledge UI."""
+    filename = file.filename or "upload"
+    data     = await file.read()
+    return await _ingest_bytes(
+        filename, data,
+        background_tasks=background_tasks,
+        title=title, agent_id=agent_id, access_level=access_level,
+        enable_docint=enable_docint.lower() in ("true", "1", "yes"),
+        collection=collection, valid_hours=valid_hours,
+    )
 
 
 # In-memory staging for DocTable nodes created during /api/ingest
@@ -3761,6 +4041,8 @@ async def ingest_document(
     doc_id      = hashlib.md5(f"{filename}-{datetime.now().isoformat()}".encode()).hexdigest()[:16]
     image_props: dict = {}
 
+    storage_key = await _store_original_to_s3(doc_id, filename, data)
+
     try:
         if _is_image(ext):
             text, image_props = await _extract_image_text(filename, data, ext)
@@ -3776,6 +4058,10 @@ async def ingest_document(
     chunks = _chunk_text(text)
     if not chunks:
         raise HTTPException(status_code=422, detail="File produced no chunks after extraction")
+
+    if storage_key:
+        image_props["storage_bucket"] = S3_BUCKET
+        image_props["storage_key"] = storage_key
 
     from datetime import timedelta
     valid_to = (

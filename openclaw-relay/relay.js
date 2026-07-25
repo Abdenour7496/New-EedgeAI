@@ -37,7 +37,7 @@ forward(18801, 18790, 'portal');
 
 function pollHealth() {
   const req = http.request(
-    { host: '::1', port: 18789, path: '/health', method: 'GET', timeout: 3000 },
+    { host: '127.0.0.1', port: 18789, path: '/health', method: 'GET', timeout: 3000 },
     res => {
       healthChecks++;
       healthStatus = res.statusCode === 200 ? 1 : 0;
