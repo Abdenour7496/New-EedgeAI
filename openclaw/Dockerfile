@@ -2,6 +2,21 @@ FROM ghcr.io/openclaw/openclaw:2026.6.11
 
 USER root
 
+# Claude Code CLI — the openclaw Anthropic plugin's "claude-cli" backend shells
+# out to this for subscription-based auth (Claude Pro/Max login), as opposed
+# to its separate metered-API-key auth path (ANTHROPIC_API_KEY). Login itself
+# is an interactive OAuth flow and has to be run by a human against a real TTY
+# (docker exec -it ... claude login) — this just makes the binary available.
+RUN npm install -g @anthropic-ai/claude-code && npm cache clean --force
+
+# `claude login` writes two things: files under ~/.claude/ (covered by the
+# openclaw_claude_config volume) AND a top-level ~/.claude.json — which isn't,
+# so it silently reverted to a fresh/logged-out state on every container
+# recreate. Symlink it into the volume-backed directory so it persists too.
+RUN mkdir -p /home/node/.claude && \
+    ln -sf /home/node/.claude/.claude.json /home/node/.claude.json && \
+    chown -R node:node /home/node/.claude /home/node/.claude.json
+
 # Install Neo4j and Qdrant Node.js drivers alongside the driver CLI scripts.
 # Files land in /opt/oc-drivers so they don't collide with OpenClaw internals.
 WORKDIR /opt/oc-drivers

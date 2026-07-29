@@ -156,7 +156,14 @@ services:
       - "9091:9091"
     environment:
       <<: *neo4j-creds
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      # Deliberately NOT set here (unlike the proxy service, which has its own
+      # copy for RAG/vision calls): the bundled `claude` CLI prefers
+      # ANTHROPIC_API_KEY over an OAuth/subscription login whenever it's
+      # present in the environment, silently ignoring `claude login` even
+      # after it succeeds. Leaving this unset forces the claude-cli backend to
+      # actually use the Claude Pro/Max subscription session instead of
+      # metered API billing.
+      # ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       COPILOT_API_KEY: ${COPILOT_API_KEY:-}
       COPILOT_GITHUB_TOKEN: ${COPILOT_API_KEY:-}
@@ -175,6 +182,9 @@ services:
     volumes:
       - ${OPENCLAW_CONFIG_DIR:-openclaw_config}:/home/node/.openclaw
       - ./openclaw-config/openclaw.json:/opt/openclaw-seed/openclaw.json:ro
+      # Claude Code CLI's own login state (claude login) — separate from
+      # OpenClaw's own config dir so the subscription auth survives restarts.
+      - openclaw_claude_config:/home/node/.claude
     healthcheck:
       test: ["CMD-SHELL", "bash -c ':> /dev/tcp/localhost/18799' || exit 0"]
       interval: 20s
@@ -601,6 +611,7 @@ volumes:
   neo4j_data:
   qdrant_data:
   openclaw_config:
+  openclaw_claude_config:
   openwebui_data:
   ollama_data:
   docs_minio_data:

@@ -128,16 +128,37 @@ mcp = FastMCP("Neo4j-Cognitive", host=HOST, port=PORT)
 
 # ── Core query tools ───────────────────────────────────────────────────────────
 
+# Hard cap on neo4j_query's returned payload — an unbounded Cypher query (e.g.
+# `MATCH (n) RETURN n` with no LIMIT) can otherwise serialize the entire graph
+# into a single tool result, which then gets fed back into the next LLM turn
+# and can blow past the model's context window (observed: 790k+ char prompts).
+_QUERY_MAX_RECORDS = 200
+_QUERY_MAX_CHARS = 40_000
+
+
 @mcp.tool()
 async def neo4j_query(cypher: str, params: str = "{}") -> str:
     """Run any Cypher query against Neo4j and return results as JSON.
     Args:
-        cypher: Cypher statement.
+        cypher: Cypher statement. Add your own LIMIT for large result sets —
+            results are capped at 200 records / 40,000 characters regardless.
         params: Optional JSON parameter object, e.g. '{"name": "Alice"}'.
     """
     try:
         records = await run(cypher, json.loads(params))
-        return json.dumps(records, default=str, indent=2)
+        truncated_records = len(records) > _QUERY_MAX_RECORDS
+        if truncated_records:
+            records = records[:_QUERY_MAX_RECORDS]
+        payload = json.dumps(records, default=str)
+        if len(payload) > _QUERY_MAX_CHARS or truncated_records:
+            payload = payload[:_QUERY_MAX_CHARS]
+            return json.dumps({
+                "truncated": True,
+                "note": f"Result exceeded {_QUERY_MAX_RECORDS} records / {_QUERY_MAX_CHARS} chars — "
+                        "add a LIMIT (and narrower RETURN properties) to your Cypher.",
+                "data_prefix": payload,
+            })
+        return payload
     except Exception as exc:
         return json.dumps({"error": str(exc)})
 

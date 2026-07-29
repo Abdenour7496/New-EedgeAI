@@ -4,6 +4,12 @@
     "auth": {
       "mode": "token"
     },
+    "controlUi": {
+      "allowedOrigins": [
+        "http://localhost:18789",
+        "http://127.0.0.1:18789"
+      ]
+    },
     "http": {
       "endpoints": {
         "chatCompletions": {
@@ -23,7 +29,7 @@
             "id": "llama3.2:latest",
             "name": "llama3.2:latest",
             "api": "ollama",
-            "reasoning": true,
+            "reasoning": false,
             "input": ["text"],
             "cost": {
               "input": 0,
@@ -41,12 +47,16 @@
   "agents": {
     "defaults": {
       "model": {
-        "primary": "github-copilot/gpt-5.4-mini",
+        "primary": "claude-cli/claude-sonnet-4-6",
         "fallbacks": [
+          "github-copilot/gpt-5.4-mini",
           "ollama/llama3.2:latest"
         ]
       },
       "models": {
+        "claude-cli/claude-sonnet-4-6": {
+          "alias": "claude"
+        },
         "github-copilot/gpt-5.4-mini": {
           "alias": "copilot"
         },

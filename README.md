@@ -595,13 +595,17 @@ docker compose -f docker-compose.unified.yml up -d <service>
 
 ### Upgrading OpenClaw
 
+`openclaw/Dockerfile` pins an exact base image tag (`FROM ghcr.io/openclaw/openclaw:<version>`), not `:latest` — `docker pull ...:latest` alone does not change what gets built. To actually upgrade, bump the tag in the Dockerfile to the version you want (see [releases](https://github.com/openclaw/openclaw/releases)), then:
+
 ```bash
-docker pull ghcr.io/openclaw/openclaw:latest
+docker pull ghcr.io/openclaw/openclaw:<new-version>
 docker compose -f docker-compose.unified.yml build --no-cache openclaw
 docker compose -f docker-compose.unified.yml up -d openclaw
 ```
 
 The Dockerfile applies a runtime hotfix patch on top of the new base image. If the patch target is no longer found (warning during build), it means the upstream version already includes the fix — this is safe to ignore.
+
+**If the container starts crash-looping with `OpenClaw startup migrations did not complete cleanly` / `Skipped Memory Core legacy memory index import ... legacy rows could not be imported`:** this happened going from `2026.6.11` → `2026.7.1` against a long-lived `openclaw_config` volume. The error message tells you to run `openclaw doctor --fix`, but as of `2026.7.1` that does **not** actually resolve this specific warning — it fixes other things (config key migrations, corrupted recall-store entries) but the gateway keeps refusing to start with the identical error on every restart. Verified via `docker compose run --rm --no-deps openclaw openclaw doctor --fix`, `openclaw memory status --deep`, and `openclaw memory status --index --agent main` — all ran clean, none cleared the warning. Until this is fixed upstream, pin back to the last known-good tag (`2026.6.11`) and rebuild rather than digging into the raw state SQLite files by hand.
 
 ---
 
@@ -615,12 +619,29 @@ docker compose -f docker-compose.unified.yml up -d --no-deps openclaw
 **OpenClaw Copilot auth failing (HTTP 403 or 404):**
 - HTTP 403 → fine-grained PAT used; switch to a classic PAT (`ghp_...`)
 - HTTP 404 → account has no active Copilot subscription
-- HTTP 429 on `gpt-5.4` → Premium quota exhausted; `gpt-4.1` fallback activates automatically
 
 Re-run the device flow to refresh the token:
 ```bash
 docker exec -it eedgeai-openclaw-1 openclaw models auth login-github-copilot --yes
 ```
+
+**"Lost connection to the LLM" / chat requests hang for exactly ~120s then fail:**
+This is almost always Copilot premium quota exhaustion (`429 quota exceeded`), not a broken connection or changed credentials — openclaw's provider plugin doesn't surface that 429 cleanly, it just hangs until its idle timeout (~120s) and reports `LLM idle timeout (120s): no response from model`. Confirm directly (bypasses openclaw's own retry/timeout handling, gives you the real status fast):
+```bash
+docker exec eedgeai-openclaw-1 node -e "
+const t = require('/home/node/.openclaw/credentials/github-copilot.token.json');
+fetch('https://api.githubcopilot.com/chat/completions', {
+  method: 'POST',
+  headers: {'Authorization': 'Bearer ' + t.token, 'Content-Type': 'application/json',
+            'Copilot-Integration-Id': 'vscode-chat', 'Editor-Version': 'vscode/1.0.0'},
+  body: JSON.stringify({model: 'gpt-4o', messages: [{role:'user', content:'ping'}], max_tokens: 5}),
+}).then(async r => console.log(r.status, await r.text()));
+"
+```
+`429` → quota exhausted, wait for it to reset (check GitHub Copilot billing) — this deployment's model list has no secondary Copilot model configured to fail over to, only the local Ollama fallback. If that fallback *also* times out even though `docker exec <ollama-container> ollama list` shows the model and direct Ollama requests are fast, that's a separate, known issue: a full agent turn bundles the system prompt plus every MCP tool's schema (`qdrant-memory`, `neo4j-graph`, etc.), and small local models can take longer than openclaw's idle timeout to churn through that on CPU-only inference — not a wiring bug.
+
+**Ollama fallback fails instantly with `"<model>" does not support thinking`:**
+The model's entry in `models.providers.ollama.models[]` has `"reasoning": true` set for a model that doesn't support Ollama's thinking-mode parameter. Set it to `false` in `openclaw-config/openclaw.json` — it hot-reloads without a container restart (`[reload] config hot reload applied` in the logs confirms it took).
 
 **OpenClaw MCP tools not available:**
 ```bash
