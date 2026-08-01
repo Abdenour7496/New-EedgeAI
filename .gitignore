@@ -4,6 +4,10 @@
 .env copy
 !.env.example
 
+# Self-signed dev certs — regenerate locally (see buzz-relay-proxy/certs/san.cnf)
+buzz-relay-proxy/certs/*.crt
+buzz-relay-proxy/certs/*.key
+
 # Local backups
 backups/
 

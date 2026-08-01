@@ -22,6 +22,7 @@ services:
       timeout: 5s
       retries: 8
       start_period: 30s
+    restart: unless-stopped
 
   neo4j-exporter:
     build: ./neo4j-exporter
@@ -45,6 +46,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    restart: unless-stopped
 
   # ── Ollama (local LLM) ────────────────────────────────────────────────────────
 
@@ -372,6 +374,7 @@ services:
         condition: service_healthy
       tts:
         condition: service_started
+    restart: unless-stopped
 
   # ── Buzz — human and agent collaboration relay (opt in: --profile buzz) ────
 
@@ -455,7 +458,15 @@ services:
       BUZZ_RELAY_PRIVATE_KEY: ${BUZZ_RELAY_PRIVATE_KEY:-}
       # Must match the `buzz` service's own RELAY_URL exactly (community rows are
       # keyed by that string at seed time) — not the docker-internal hostname.
-      RELAY_URL: ${BUZZ_RELAY_URL:-ws://localhost:3010}
+      # 127.0.0.1, not localhost: Buzz Desktop's native-agent runtime (buzz-acp)
+      # always dials the local relay via 127.0.0.1 regardless of configured
+      # relay_url, and unlike NIP-42 (WS auth, aliases localhost/127.0.0.1),
+      # the NIP-98 HTTP bridge auth used by /query and /events does NOT alias
+      # them (deliberate, added in the multi-tenant rewrite) — so the
+      # community's canonical host has to literally be 127.0.0.1:3010 or every
+      # native agent's channel-discovery call 401s and the agent never gets to
+      # answer anything.
+      RELAY_URL: ${BUZZ_RELAY_URL:-ws://127.0.0.1:3010}
     depends_on:
       buzz-postgres:
         condition: service_healthy
@@ -464,13 +475,23 @@ services:
   buzz:
     image: ghcr.io/block/buzz:latest
     profiles: ["buzz"]
-    ports:
-      - "3010:3000"
+    # No host port published here anymore — see buzz-relay-proxy below, which
+    # now owns host port 3010 for ALL host-side clients (browser, Buzz Desktop,
+    # and Buzz Desktop's spawned native agents alike), not just buzz-agent-bridge.
+    # Reason: Buzz Desktop's native-agent-hosting subsystem connects via
+    # ws://127.0.0.1:3010 regardless of the community's configured relay URL
+    # (ws://localhost:3010) — a literal IP, not a hostname, so it can't be
+    # redirected via extra_hosts the way buzz-agent-bridge's own connection is.
+    # Routing every host-side client through this Host-rewriting proxy sidesteps
+    # that mismatch entirely instead of trying to make 127.0.0.1 and localhost
+    # both resolve to the same registered community (communities.host is
+    # unique — only one literal string can ever be registered).
     environment:
       DATABASE_URL: postgres://buzz:${BUZZ_POSTGRES_PASSWORD:-buzz_dev}@buzz-postgres:5432/buzz
       REDIS_URL: redis://buzz-redis:6379
       BUZZ_BIND_ADDR: 0.0.0.0:3000
-      RELAY_URL: ${BUZZ_RELAY_URL:-ws://localhost:3010}
+      # See buzz-migrate's RELAY_URL comment — must be 127.0.0.1, not localhost.
+      RELAY_URL: ${BUZZ_RELAY_URL:-ws://127.0.0.1:3010}
       BUZZ_S3_ENDPOINT: http://buzz-minio:9000
       BUZZ_S3_ACCESS_KEY: ${BUZZ_S3_ACCESS_KEY:-buzz_dev}
       BUZZ_S3_SECRET_KEY: ${BUZZ_S3_SECRET_KEY:-buzz_dev_secret}
@@ -499,19 +520,36 @@ services:
     restart: unless-stopped
 
   # Rewrites the Host header to whatever the buzz service's single community row
-  # is keyed to (see buzz-relay-proxy/nginx.conf) so server-side clients on the
-  # internal docker network (buzz-agent-bridge, ad-hoc buzz-cli calls) resolve to
-  # the same community the desktop/web client uses — without touching that
-  # client's own connection at all.
+  # is keyed to (see buzz-relay-proxy/nginx.conf) so EVERY client — server-side
+  # (buzz-agent-bridge, which shares this container's network namespace — see
+  # its network_mode) and host-side (browser, Buzz Desktop, and Buzz Desktop's
+  # spawned native agents, via the published port below) — resolves to the
+  # same community, regardless of whether they dial in as "localhost" or
+  # "127.0.0.1". The community's canonical host is 127.0.0.1:3010 (not
+  # localhost:3010): Buzz Desktop's native-agent runtime always dials the
+  # local relay via 127.0.0.1 regardless of configured relay_url, and the
+  # NIP-98 HTTP bridge auth used by /query and /events does not alias
+  # localhost/127.0.0.1 the way the WS NIP-42 auth does — see RELAY_URL
+  # comment on buzz-migrate.
   buzz-relay-proxy:
     image: nginx:alpine
     profiles: ["buzz"]
+    ports:
+      # Host 3010 -> container's plain listener (3010), matching RELAY_URL's
+      # ws:// scheme. Tried routing this through the container's TLS listener
+      # (3443) instead, to test whether Buzz Desktop's native agents need
+      # wss:// like Block's own hosted relay — reverted because the server's
+      # self-identity (RELAY_URL) is shared by ALL clients including
+      # buzz-agent-bridge, which can only ever reach the plain-only internal
+      # listener; there's no way to give host-side clients wss:// without
+      # breaking buzz-agent-bridge's NIP-42 auth (its signed relay tag must
+      # match the server's self-identity exactly, not just be reachable).
+      # The TLS listener (3443) stays defined in nginx.conf and the cert
+      # volume stays mounted, but nothing publishes 3443 to the host right now.
+      - "3010:3010"
     volumes:
       - ./buzz-relay-proxy/nginx.conf:/etc/nginx/nginx.conf:ro
-    networks:
-      default: {}
-      buzz_bridge_net:
-        ipv4_address: 172.29.42.10
+      - ./buzz-relay-proxy/certs:/etc/nginx/certs:ro
     depends_on:
       buzz:
         condition: service_healthy
@@ -533,20 +571,20 @@ services:
     profiles: ["buzz"]
     # buzz-acp signs its NIP-42 auth event with a "relay" tag equal to whatever
     # --relay-url it was given, and the server requires that to match its own
-    # configured self-identity (ws://localhost:3010) — not just be *reachable*.
-    # So this has to literally say localhost:3010, and extra_hosts + the static
-    # IP on buzz_bridge_net make that name route to buzz-relay-proxy instead of
-    # this container's own loopback (which has nothing listening on 3010).
-    extra_hosts:
-      - "localhost:172.29.42.10"
-    networks:
-      default: {}
-      buzz_bridge_net: {}
+    # configured self-identity (ws://127.0.0.1:3010, see RELAY_URL comment on
+    # buzz-migrate) — not just be *reachable*. So this has to literally say
+    # 127.0.0.1:3010. Unlike "localhost", 127.0.0.1 is a literal IP — clients
+    # skip hosts-file/DNS resolution for literal IPs entirely, so the old
+    # extra_hosts trick (redirecting the hostname "localhost" to
+    # buzz-relay-proxy's static IP) can't redirect it. Sharing buzz-relay-proxy's
+    # network namespace instead makes "127.0.0.1" genuinely be buzz-relay-proxy
+    # from this container's point of view — no redirection needed.
+    network_mode: "service:buzz-relay-proxy"
     environment:
       # Required at runtime — validated by entrypoint.sh (not here: `${VAR:?}` would
       # break `docker compose config`/`up` for the *default* profile too, since
       # compose interpolates every service's env block regardless of --profile).
-      BUZZ_RELAY_URL: ws://localhost:3010
+      BUZZ_RELAY_URL: ws://127.0.0.1:3010
       BUZZ_PRIVATE_KEY: ${BUZZ_AGENT_PRIVATE_KEY:-}
       BUZZ_ACP_CHANNELS: ${BUZZ_KNOWLEDGE_CHANNELS:-}
       BUZZ_ACP_SUBSCRIBE: mentions
@@ -583,6 +621,7 @@ services:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
     ports:
       - "9090:9090"
+    restart: unless-stopped
 
   grafana:
     image: grafana/grafana
@@ -595,17 +634,7 @@ services:
       - ./monitoring/grafana-provisioning:/etc/grafana/provisioning
     depends_on:
       - prometheus
-
-# Only buzz-relay-proxy and buzz-agent-bridge attach to buzz_bridge_net —
-# everything else stays on the plain implicit default network, untouched.
-# It exists purely so buzz-relay-proxy can have a static IP that
-# buzz-agent-bridge can route to via its "localhost" override (see that
-# service's extra_hosts) — a fixed subnet is required to pin an IP.
-networks:
-  buzz_bridge_net:
-    ipam:
-      config:
-        - subnet: 172.29.42.0/24
+    restart: unless-stopped
 
 volumes:
   neo4j_data:
