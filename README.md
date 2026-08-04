@@ -23,7 +23,7 @@ User
  └─► Edge TTS      (localhost:5050)    ← OpenAI-compatible text-to-speech (Microsoft Edge voices)
 
 Buzz (optional: `--profile buzz`)
- └─► Buzz Relay     (localhost:3010)    ← human + agent collaboration workspace
+ └─► Buzz Relay     (127.0.0.1:3010)    ← human + agent collaboration workspace
    ├─► Postgres                         ← Buzz event store
    ├─► Redis                            ← presence and pub/sub
    ├─► MinIO                            ← media and Git object storage
@@ -229,7 +229,7 @@ Buzz is isolated behind a Compose profile so it does not affect the default stac
 docker compose -f docker-compose.unified.yml --profile buzz up -d buzz
 ```
 
-Open `http://localhost:3010` for the bundled web UI, or configure a Buzz desktop client with `ws://localhost:3010`. Before exposing the relay beyond a trusted local network, replace the development Buzz passwords in `.env` and set `BUZZ_RELAY_URL` to its public `wss://` URL.
+Open `http://127.0.0.1:3010` for the bundled web UI, or configure a Buzz desktop client with `ws://127.0.0.1:3010`. Use `localhost:3010` instead and Buzz Desktop's native-agent runtime (`buzz-acp`, which always dials `127.0.0.1` regardless of configured relay URL) will 401 on its ordinary `/query` calls — so `127.0.0.1:3010` is the host that keeps native agents working, at the cost of the app's onboarding/profile-save call (separately hardcoded to sign against `localhost` no matter what) 401ing instead (see the Knowledge Bridge section below for the full tradeoff). Before exposing the relay beyond a trusted local network, replace the development Buzz passwords in `.env` and set `BUZZ_RELAY_URL` to its public `wss://` URL.
 
 #### Optional: Knowledge Bridge (Buzz ↔ GCOR)
 
@@ -237,11 +237,10 @@ Lets both humans and agents in a Buzz channel retrieve GCOR collections/document
 
 **How it works:** `buzz-agent-bridge` runs upstream `buzz-acp` (built from [block/buzz](https://github.com/block/buzz), pinned tag) — a first-party harness that holds its own Nostr keypair, authenticates to the Buzz relay, and watches only the channel(s) it's configured for. On a mention it spawns `buzz-bridge/reply_adapter.py` for that turn — a small deterministic agent (not an LLM tool-calling loop): it calls the GCOR proxy's `POST /v1/buzz/chat/completions` and *always* posts whatever text comes back via `buzz messages send`, threaded as a reply. (We initially tried the upstream `buzz-agent` + a `buzz-dev-mcp` shell tool, matching how Buzz's own agents work — the model would answer the question correctly but frequently never chose to invoke the "post it" tool call, so replies silently vanished. The deterministic adapter removes that judgment call: the model never decides whether or what to execute, it can only answer the question that reached it.) `/v1/buzz/chat/completions` is a route separate from the normal chat endpoint, gated behind a bearer token (`BUZZ_BRIDGE_API_KEY`) since Buzz channel content is a less-trusted source than the rest of the internal docker network.
 
-A `buzz-relay-proxy` sidecar (nginx) also sits in front of the relay for the bridge's own traffic. The relay resolves which "community"/workspace a request belongs to strictly by the exact `Host` header it arrives on (`communities.host` in Postgres, unique — no aliasing), set to whatever host the Buzz desktop/web client first connected through (typically `localhost:3010`). Traffic from inside the docker network naturally arrives as `buzz:3000` and gets rejected outright (`404: no community configured for this host`) — including the NIP-42 auth handshake itself, since `buzz-acp` signs its auth event claiming the exact relay URL it was given, and the server requires that to match its own self-identity, not just be reachable. `buzz-relay-proxy` rewrites the Host header for the bridge's traffic; a static IP on a dedicated `buzz_bridge_net` network plus an `extra_hosts` override make `ws://localhost:3010` (what the bridge is configured to claim) actually route to that proxy instead of the container's own loopback. None of this touches how the desktop/web client itself connects.
+A `buzz-relay-proxy` sidecar (nginx) also sits in front of the relay for the bridge's own traffic. The relay resolves which "community"/workspace a request belongs to strictly by the exact `Host` header it arrives on (`communities.host` in Postgres, unique — no aliasing), set to the stack's canonical host, `127.0.0.1:3010` (not `localhost:3010` — `buzz-acp`'s native-agent runtime always dials the relay via `127.0.0.1` regardless of configured relay URL, and NIP-98 HTTP auth, unlike NIP-42 WS auth, doesn't alias `localhost`/`127.0.0.1`, so a `localhost` canonical host 401s every native agent's ordinary `/query` call). The cost: Buzz Desktop's onboarding/profile-save call is separately hardcoded to sign against `localhost` regardless of configured relay URL, so under `127.0.0.1` canonical that call 401s and blocks onboarding for new/unmigrated identities — confirmed live in both directions on 2026-08-03; see the RELAY_URL comment on `buzz-migrate` in `docker-compose.unified.yml` for the full tradeoff. Traffic from inside the docker network naturally arrives as `buzz:3000` and gets rejected outright (`404: no community configured for this host`) — including the NIP-42 auth handshake itself, since `buzz-acp` signs its auth event claiming the exact relay URL it was given, and the server requires that to match its own self-identity, not just be reachable. `buzz-relay-proxy` rewrites the Host header for the bridge's traffic; `buzz-agent-bridge` shares `buzz-relay-proxy`'s network namespace (`network_mode: service:buzz-relay-proxy`) so `ws://127.0.0.1:3010` (what the bridge is configured to claim) actually routes to that proxy instead of the container's own loopback. None of this touches how the desktop/web client itself connects — point those at `127.0.0.1:3010` too, per the note above.
 
 Security is layered:
-- **Channel membership** (Buzz-side ACL) — invite the bridge identity into a channel exactly like inviting a person; it never sees channels it isn't a member of. Membership itself requires an existing owner/admin of that channel to grant it — neither the bridge nor the relay's own admin key can self-escalate into a channel.
-- **`BUZZ_KNOWLEDGE_CHANNELS`** — an explicit allow-list the bridge itself enforces, independent of relay-side membership.
+- **Channel membership** (Buzz-side ACL) — the bridge only ever sees channels it's a member of. `channel_supervisor.sh` (the container's entrypoint) keeps `buzz-acp`'s `--channels` in sync with that membership automatically: it self-joins every *open* channel in the community, and picks up any *private* channel the moment an existing owner/admin invites the bridge's pubkey from the Buzz client — no config edit or restart needed either way. Neither the bridge nor the relay's own admin key can self-escalate into a private channel; that invite has to come from a real owner/admin of it.
 - **`BUZZ_ACP_SUBSCRIBE=mentions`** — only triggers on an explicit `@mention`, not every message in the channel.
 - **No LLM-driven tool/shell access** — `reply_adapter.py` deterministically does exactly one thing (ask the proxy, post the answer); the model has no ability to choose or execute any other action.
 - **`BUZZ_BRIDGE_API_KEY`** — bearer token required by the proxy; `/v1/buzz/chat/completions` and `/v1/buzz/ingest` both return `503` if it isn't set, and `401` on a bad/missing token.
@@ -270,15 +269,8 @@ docker compose -f docker-compose.unified.yml --profile buzz run --rm \
 Then, in `.env`:
 - Paste the secret key from step 2 into `BUZZ_AGENT_PRIVATE_KEY`
 - Generate a secret with `openssl rand -hex 32` and set both `BUZZ_BRIDGE_API_KEY` (this value is read by both the proxy and the bridge)
-- Find (or create) the target channel's UUID — easiest via `SELECT id, name FROM channels;` in `buzz-postgres` if you don't want to dig through the client UI — and set `BUZZ_KNOWLEDGE_CHANNELS` to it (comma-separated for multiple)
-- Get the bridge's pubkey into that channel. If the channel has an open add-policy, the bridge can self-join:
-  ```bash
-  docker compose -f docker-compose.unified.yml --profile buzz run --rm \
-    --entrypoint /usr/local/bin/buzz-cli -e BUZZ_RELAY_URL=ws://localhost:3010 \
-    -e BUZZ_PRIVATE_KEY=<bridge-secret-key-from-step-2> \
-    buzz-agent-bridge channels join --channel <channel-uuid>
-  ```
-  Private channels need an existing owner/admin to invite the bridge's pubkey from the Buzz client instead — the bridge (and even the relay's own admin key) can't add itself to those.
+
+No channel configuration is needed beyond that — `channel_supervisor.sh` self-joins every open channel automatically on startup (and polls every 60s for new ones). For a **private** channel, an existing owner/admin still has to invite the bridge's pubkey once from the Buzz client (same NIP-29 rule that applies to inviting a person — nothing can bypass it); once invited, the bridge picks it up on its next poll with no restart required.
 
 ```bash
 docker compose -f docker-compose.unified.yml --profile buzz up -d buzz-relay-proxy buzz-agent-bridge
@@ -296,7 +288,7 @@ If a triggering message has both an image attachment and other text, the attachm
 **Giving it a display name:** worth doing, not just cosmetic — Buzz's `@name` mention parsing resolves display names against channel members' `kind:0` profiles, so an unnamed identity can't reliably be `@mentioned` by typing at all (only via a raw `nostr:` URI). `buzz-relay-proxy` (started above) makes this work from inside the docker network:
 ```bash
 docker compose -f docker-compose.unified.yml --profile buzz run --rm \
-  --entrypoint /usr/local/bin/buzz-cli -e BUZZ_RELAY_URL=ws://localhost:3010 \
+  --entrypoint /usr/local/bin/buzz-cli -e BUZZ_RELAY_URL=ws://127.0.0.1:3010 \
   -e BUZZ_PRIVATE_KEY=<bridge-secret-key-from-step-2> \
   buzz-agent-bridge users set-profile --name "gcor-bot" --about "Mention me with a question and I'll answer from the GCOR document collections."
 ```
@@ -705,7 +697,7 @@ docker compose -f docker-compose.unified.yml --profile buzz logs -f buzz-agent-b
 Set `BUZZ_RELAY_PRIVATE_KEY` in `.env` (generate with `buzz-migrate generate-key`) and restart `buzz` — see the Knowledge Bridge setup steps above. This is the relay's own stable signing key, separate from the bridge's identity.
 
 **`buzz-admin`/`buzz-cli` fails with `no community is configured for this host` (or `RELAY_URL host '...' is not mapped to a community`):**
-The relay routes by the exact `Host` header a request arrives with, matched against the single row in the `communities` table (`SELECT host FROM communities;` in `buzz-postgres` to check what it's actually set to — normally `localhost:3010`). `buzz-admin` commands need `RELAY_URL` set to match that string exactly (already wired into the `buzz-migrate` service's environment, so plain `docker compose run buzz-migrate ...` works). For `buzz-cli`, route it through `buzz-relay-proxy` — run it via `docker compose run --rm --entrypoint /usr/local/bin/buzz-cli ... buzz-agent-bridge ...` with `-e BUZZ_RELAY_URL=ws://localhost:3010` (that service already has the `extra_hosts`/`buzz_bridge_net` wiring that makes that address actually resolve to the proxy).
+The relay routes by the exact `Host` header a request arrives with, matched against the single row in the `communities` table (`SELECT host FROM communities;` in `buzz-postgres` to check what it's actually set to — normally `127.0.0.1:3010`). `buzz-admin` commands need `RELAY_URL` set to match that string exactly (already wired into the `buzz-migrate` service's environment, so plain `docker compose run buzz-migrate ...` works). For `buzz-cli`, route it through `buzz-relay-proxy` — run it via `docker compose run --rm --entrypoint /usr/local/bin/buzz-cli ... buzz-agent-bridge ...` with `-e BUZZ_RELAY_URL=ws://127.0.0.1:3010` (that service already shares `buzz-relay-proxy`'s network namespace, which makes that address actually resolve to the proxy).
 
 **`buzz-cli channels add-member`/`channels join` fails with `restricted: not a channel member`:**
 Only an existing member with sufficient role can add others to a *channel* (separate from relay membership) — neither the bridge's own identity nor the relay's admin key qualify by default. If the channel has an open add-policy, the target identity can `channels join` itself; otherwise an existing owner/admin has to invite it from the Buzz client.

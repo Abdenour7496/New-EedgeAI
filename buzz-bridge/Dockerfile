@@ -1,7 +1,12 @@
 # Builds the upstream block/buzz binaries our Buzz integration needs, plus our
 # own deterministic reply adapter (see reply_adapter.py):
-#   buzz-acp     — connects to the Buzz relay (WebSocket + Nostr auth), watches the
-#                  allow-listed channel(s), and bridges messages to an ACP agent over stdio.
+#   buzz-acp     — connects to the Buzz relay (WebSocket + Nostr auth), watches
+#                  whatever channel(s) channel_supervisor.sh currently passes it,
+#                  and bridges messages to an ACP agent over stdio.
+#   channel_supervisor.sh — computes buzz-acp's --channels from this identity's
+#                  live channel membership (open channels self-joined
+#                  automatically; private ones need a one-time owner invite)
+#                  and relaunches buzz-acp only when that set changes.
 #   reply_adapter.py — the actual agent_command. Deterministically calls the GCOR
 #                  proxy and always posts the answer via `buzz messages send` —
 #                  no LLM tool-call decision in the loop (see file header for why:
@@ -45,7 +50,8 @@ COPY --from=builder /build/target/release/buzz /usr/local/bin/buzz
 RUN ln -s /usr/local/bin/buzz /usr/local/bin/buzz-cli
 COPY reply_adapter.py /usr/local/bin/reply_adapter.py
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/reply_adapter.py
+COPY channel_supervisor.sh /usr/local/bin/channel_supervisor.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/reply_adapter.py /usr/local/bin/channel_supervisor.sh
 
 USER buzzbridge
 WORKDIR /home/buzzbridge

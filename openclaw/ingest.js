@@ -5,6 +5,10 @@
  * Reads a file (or stdin), chunks the text, creates Document + Chunk nodes
  * in Neo4j, embeds each chunk, and upserts it to Qdrant with the Neo4j
  * elementId so the GCOR proxy can traverse from vector hits to graph context.
+ * Also persists the original input to MinIO (best-effort — see
+ * storeOriginalToS3) under the same originals/<document_id>/<filename>
+ * convention proxy/main.py uses, so a document is findable in object storage
+ * regardless of which ingestion path it came through.
  *
  * Supported formats
  * -----------------
@@ -30,10 +34,12 @@
 
 const fs      = require('fs');
 const path    = require('path');
+const http    = require('http');
 const https   = require('https');
 const crypto  = require('crypto');
 const neo4j   = require('neo4j-driver');
 const { QdrantClient } = require('@qdrant/js-client-rest');
+const { Client: MinioClient } = require('minio');
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
@@ -46,6 +52,27 @@ const OPENAI_API_KEY  = process.env.OPENAI_API_KEY    || '';
 const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL   || 'text-embedding-3-small';
 const DEFAULT_ACCESS  = process.env.DEFAULT_ACCESS_LEVEL || 'public';
 const DEFAULT_COLLECTION = process.env.QDRANT_COLLECTION || 'documents';
+
+// Embedding backend — mirrors proxy/main.py's EMBEDDING_BACKEND/_embed_batch
+// exactly (same Ollama OpenAI-compatible /v1/embeddings shape), defaulting to
+// 'ollama' for the same reason the proxy's compose service does: the shared
+// "documents" Qdrant collection is built from nomic-embed-text (768-dim), not
+// an OpenAI model (1536-dim) — using OpenAI here would both need billing
+// credits ingest-cli has no control over *and* upsert vectors the wrong
+// dimension for the collection it's writing into.
+const EMBEDDING_BACKEND     = process.env.EMBEDDING_BACKEND     || 'ollama';
+const OLLAMA_BASE_URL       = process.env.OLLAMA_BASE_URL       || 'http://ollama:11434';
+const OLLAMA_EMBEDDING_MODEL = process.env.OLLAMA_EMBEDDING_MODEL || 'nomic-embed-text';
+
+// Document storage (MinIO, S3-compatible) — same bucket/key convention as
+// proxy/main.py's _store_original_to_s3, so a document ingested via either
+// path lands in the same place. Best-effort: ingestion still succeeds if
+// MinIO is unreachable or unconfigured, it just skips persisting the original.
+const S3_ENDPOINT_URL     = process.env.S3_ENDPOINT_URL     || 'http://minio:9000';
+const S3_ACCESS_KEY       = process.env.S3_ACCESS_KEY       || '';
+const S3_SECRET_KEY       = process.env.S3_SECRET_KEY       || '';
+const S3_BUCKET           = process.env.S3_BUCKET           || 'documents';
+const S3_ORIGINALS_PREFIX = process.env.S3_ORIGINALS_PREFIX || 'originals/';
 
 // ── CLI args ─────────────────────────────────────────────────────────────────
 
@@ -156,29 +183,43 @@ function chunkText(text, size = CHUNK_SIZE, overlap = CHUNK_OVERLAP) {
 }
 
 // ── Embedding ─────────────────────────────────────────────────────────────────
+//
+// Both backends speak the same OpenAI-compatible /v1/embeddings request/
+// response shape (Ollama included), so one request function covers both —
+// just the transport (https vs http) and target host/auth differ.
 
 function embedTexts(texts) {
+  if (EMBEDDING_BACKEND === 'ollama') {
+    const u = new URL(`${OLLAMA_BASE_URL}/v1/embeddings`);
+    return embeddingsRequest(http, {
+      hostname: u.hostname,
+      port:     u.port || 80,
+      path:     u.pathname,
+      method:   'POST',
+      headers:  { 'Content-Type': 'application/json' },
+    }, { input: texts, model: OLLAMA_EMBEDDING_MODEL });
+  }
+  if (!OPENAI_API_KEY) return Promise.reject(new Error('OPENAI_API_KEY is not set'));
+  return embeddingsRequest(https, {
+    hostname: 'api.openai.com',
+    path:     '/v1/embeddings',
+    method:   'POST',
+    headers:  { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+  }, { input: texts, model: EMBEDDING_MODEL });
+}
+
+function embeddingsRequest(transport, options, payload) {
   return new Promise((resolve, reject) => {
-    if (!OPENAI_API_KEY) return reject(new Error('OPENAI_API_KEY is not set'));
-    const body = JSON.stringify({ input: texts, model: EMBEDDING_MODEL });
-    const req = https.request(
-      {
-        hostname: 'api.openai.com',
-        path: '/v1/embeddings',
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(body),
-        },
-      },
+    const body = JSON.stringify(payload);
+    const req = transport.request(
+      { ...options, headers: { ...options.headers, 'Content-Length': Buffer.byteLength(body) } },
       res => {
         let data = '';
         res.on('data', d => { data += d; });
         res.on('end', () => {
           try {
             const parsed = JSON.parse(data);
-            if (parsed.error) return reject(new Error(parsed.error.message));
+            if (parsed.error) return reject(new Error(parsed.error.message || JSON.stringify(parsed.error)));
             // Return embeddings in index order
             const sorted = parsed.data.sort((a, b) => a.index - b.index);
             resolve(sorted.map(d => d.embedding));
@@ -190,6 +231,56 @@ function embedTexts(texts) {
     req.write(body);
     req.end();
   });
+}
+
+// ── MinIO (S3-compatible object storage) ───────────────────────────────────────
+
+let _minioClient = null;
+let _minioClientInit = false;
+
+function getMinioClient() {
+  if (!_minioClientInit) {
+    _minioClientInit = true;
+    if (S3_ACCESS_KEY && S3_SECRET_KEY) {
+      const u = new URL(S3_ENDPOINT_URL);
+      _minioClient = new MinioClient({
+        endPoint: u.hostname,
+        port:     u.port ? parseInt(u.port, 10) : (u.protocol === 'https:' ? 443 : 80),
+        useSSL:   u.protocol === 'https:',
+        accessKey: S3_ACCESS_KEY,
+        secretKey: S3_SECRET_KEY,
+      });
+    }
+  }
+  return _minioClient;
+}
+
+// Persist the raw input bytes to MinIO, creating the bucket if needed.
+// Returns the object key, or null on failure/unconfigured — mirrors
+// proxy/main.py's _store_original_to_s3 (same key scheme, same
+// best-effort semantics) so documents ingested via either path are
+// findable under the same originals/<document_id>/<filename> convention.
+async function storeOriginalToS3(documentId, filename, buffer, bucket = S3_BUCKET) {
+  const client = getMinioClient();
+  if (!client) return null;
+  const key = `${S3_ORIGINALS_PREFIX}${documentId}/${filename}`;
+  try {
+    const exists = await client.bucketExists(bucket).catch(() => false);
+    if (!exists) {
+      try {
+        await client.makeBucket(bucket);
+      } catch (err) {
+        if (!/already own|BucketAlready/i.test(err.message || '')) throw err;
+      }
+    }
+    await client.putObject(bucket, key, buffer);
+    return key;
+  } catch (err) {
+    process.stderr.write(
+      `[ingest] S3 store of original file failed (doc_id=${documentId}, bucket=${bucket}): ${err.message}\n`
+    );
+    return null;
+  }
 }
 
 // ── Neo4j ────────────────────────────────────────────────────────────────────
@@ -405,6 +496,16 @@ function md5Uuid(str) {
       }
     }
 
+    // MinIO — best-effort original-file copy, same convention proxy/main.py uses
+    const storageFilename = filePath
+      ? path.basename(filePath)
+      : `${title.replace(/[^\w.\-]+/g, '_') || 'stdin'}.txt`;
+    const storageKey = await storeOriginalToS3(documentId, storageFilename, rawBuffer);
+    if (storageKey) {
+      imageProps.storage_bucket = S3_BUCKET;
+      imageProps.storage_key    = storageKey;
+    }
+
     // Neo4j
     process.stderr.write('[ingest] Writing to Neo4j...\n');
     const { docEid, chunkEids } = await neo4jIngest(
@@ -425,6 +526,7 @@ function md5Uuid(str) {
       qdrant_points: upserted,
       collection,
       ..._imageMetadata && { image_metadata: _imageMetadata },
+      ...storageKey && { storage: { bucket: S3_BUCKET, key: storageKey } },
     };
     process.stdout.write(JSON.stringify(result, null, 2) + '\n');
   } catch (err) {

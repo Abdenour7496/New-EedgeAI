@@ -17,8 +17,9 @@ RUN mkdir -p /home/node/.claude && \
     ln -sf /home/node/.claude/.claude.json /home/node/.claude.json && \
     chown -R node:node /home/node/.claude /home/node/.claude.json
 
-# Install Neo4j and Qdrant Node.js drivers alongside the driver CLI scripts.
-# Files land in /opt/oc-drivers so they don't collide with OpenClaw internals.
+# Install Neo4j, Qdrant, and MinIO Node.js drivers alongside the driver CLI
+# scripts. Files land in /opt/oc-drivers so they don't collide with OpenClaw
+# internals.
 WORKDIR /opt/oc-drivers
 COPY openclaw/package.json .
 RUN npm install --production && npm cache clean --force

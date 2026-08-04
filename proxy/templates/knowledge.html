@@ -464,6 +464,11 @@
         <label class="form-label">TTL (hours) <span style="color:var(--text-muted)">— leave 0 for permanent</span></label>
         <input type="number" id="ingest-ttl" class="form-input" placeholder="0" min="0" step="1" value="0">
       </div>
+      <div class="form-group">
+        <label class="form-label">Storage bucket <span style="color:var(--text-muted)">(optional — pick one or type a new name to create it)</span></label>
+        <input type="text" id="ingest-bucket" class="form-input" list="ingest-bucket-list" placeholder="documents">
+        <datalist id="ingest-bucket-list"></datalist>
+      </div>
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;padding:10px 12px;background:var(--surface-2,#1a2235);border-radius:6px;border:1px solid var(--border,#2d3a50)">
         <input type="checkbox" id="ingest-docint" style="width:auto;margin:0;accent-color:#7dd3fc">
         <div>
@@ -804,7 +809,20 @@
     document.getElementById('drop-label').innerHTML = '<strong>Click to upload</strong> or drag &amp; drop';
     document.getElementById('file-input').value = '';
     document.getElementById('ingest-title').value = '';
+    document.getElementById('ingest-bucket').value = '';
     document.getElementById('ingest-modal').classList.add('open');
+    loadBucketOptions();
+  }
+
+  async function loadBucketOptions() {
+    const list = document.getElementById('ingest-bucket-list');
+    const bucketInput = document.getElementById('ingest-bucket');
+    try {
+      const r = await fetch('/api/buckets');
+      const d = await r.json();
+      list.innerHTML = d.buckets.map(b => `<option value="${esc(b.name)}">`).join('');
+      bucketInput.placeholder = d.default || 'documents';
+    } catch (e) { /* best-effort — free-text entry still works without the list */ }
   }
 
   function onFileSelected(inp) {
@@ -834,13 +852,16 @@
     fd.append('valid_hours',   document.getElementById('ingest-ttl').value || '0');
     fd.append('enable_docint', useDocInt ? 'true' : 'false');
     if (_ingestCol) fd.append('collection', _ingestCol);
+    const bucketVal = document.getElementById('ingest-bucket').value.trim();
+    if (bucketVal) fd.append('bucket', bucketVal);
 
     try {
       const r = await fetch('/api/ingest', { method: 'POST', body: fd });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
 
-      ok.innerHTML = `✓ <strong>${esc(d.title)}</strong> ingested — ${d.chunks} chunks · ${d.qdrant_points} vectors`;
+      const bucketNote = d.storage ? ` · bucket "${esc(d.storage.bucket)}"` : '';
+      ok.innerHTML = `✓ <strong>${esc(d.title)}</strong> ingested — ${d.chunks} chunks · ${d.qdrant_points} vectors${bucketNote}`;
       ok.style.display = 'block';
 
       // Render Document Intelligence summary if available

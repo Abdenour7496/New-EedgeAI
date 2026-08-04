@@ -181,6 +181,18 @@ services:
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: ${QDRANT_COLLECTION:-documents}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
+      # ingest-cli embedding backend — mirrors the proxy's own copy of these
+      # vars so both write vectors of the same dimension into the shared
+      # "documents" Qdrant collection (768-dim, from nomic-embed-text).
+      EMBEDDING_BACKEND: ${EMBEDDING_BACKEND:-ollama}
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}
+      # Document storage (MinIO) for ingest-cli — best-effort, same as the
+      # proxy's own copy of these vars; ingestion still works if unset/unreachable.
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: ${DOCS_S3_ACCESS_KEY:-gcor_docs}
+      S3_SECRET_KEY: ${DOCS_S3_SECRET_KEY:-gcor_docs_secret}
+      S3_BUCKET: ${DOCS_S3_BUCKET:-documents}
     volumes:
       - ${OPENCLAW_CONFIG_DIR:-openclaw_config}:/home/node/.openclaw
       - ./openclaw-config/openclaw.json:/opt/openclaw-seed/openclaw.json:ro
@@ -263,6 +275,7 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    restart: unless-stopped
 
   # ── Document storage (MinIO, S3-compatible) ───────────────────────────────────
 
@@ -294,12 +307,22 @@ services:
       DOCS_S3_ACCESS_KEY: ${DOCS_S3_ACCESS_KEY:-gcor_docs}
       DOCS_S3_SECRET_KEY: ${DOCS_S3_SECRET_KEY:-gcor_docs_secret}
       DOCS_S3_BUCKET: ${DOCS_S3_BUCKET:-documents}
+      # Buzz media and Open WebUI file storage share this same MinIO instance
+      # (see buzz's BUZZ_S3_ENDPOINT and openwebui's S3_ENDPOINT_URL below) —
+      # one object store for the whole stack instead of a separate MinIO per
+      # service. Pre-created here since neither app auto-creates its bucket.
+      BUZZ_S3_BUCKET: ${BUZZ_S3_BUCKET:-buzz-media}
+      OPENWEBUI_S3_BUCKET: ${OPENWEBUI_S3_BUCKET:-openwebui}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >-
         mc alias set local http://minio:9000 "$${DOCS_S3_ACCESS_KEY}" "$${DOCS_S3_SECRET_KEY}"
         && mc mb --ignore-existing "local/$${DOCS_S3_BUCKET}"
         && mc anonymous set none "local/$${DOCS_S3_BUCKET}"
+        && mc mb --ignore-existing "local/$${BUZZ_S3_BUCKET}"
+        && mc anonymous set none "local/$${BUZZ_S3_BUCKET}"
+        && mc mb --ignore-existing "local/$${OPENWEBUI_S3_BUCKET}"
+        && mc anonymous set none "local/$${OPENWEBUI_S3_BUCKET}"
     restart: "no"
 
   # Polls documents/inbox/ and pushes new files into the proxy's /api/ingest —
@@ -365,6 +388,15 @@ services:
       AUDIO_TTS_OPENAI_API_KEY: ${TTS_API_KEY:-tts-local}
       AUDIO_TTS_MODEL: tts-1
       AUDIO_TTS_VOICE: ${TTS_DEFAULT_VOICE:-en-US-AriaNeural}
+      # File/attachment storage on the stack-wide MinIO instance (see
+      # minio-init) instead of the local volume — the sqlite DB, config, etc.
+      # still live on openwebui_data below; only uploaded files move to S3.
+      STORAGE_PROVIDER: s3
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY_ID: ${DOCS_S3_ACCESS_KEY:-gcor_docs}
+      S3_SECRET_ACCESS_KEY: ${DOCS_S3_SECRET_KEY:-gcor_docs_secret}
+      S3_REGION_NAME: us-east-1
+      S3_BUCKET_NAME: ${OPENWEBUI_S3_BUCKET:-openwebui}
     volumes:
       - openwebui_data:/app/backend/data
     depends_on:
@@ -374,6 +406,8 @@ services:
         condition: service_healthy
       tts:
         condition: service_started
+      minio-init:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   # ── Buzz — human and agent collaboration relay (opt in: --profile buzz) ────
@@ -409,41 +443,6 @@ services:
       start_period: 5s
     restart: unless-stopped
 
-  buzz-minio:
-    image: minio/minio:latest
-    profiles: ["buzz"]
-    command: server /data
-    environment:
-      MINIO_ROOT_USER: ${BUZZ_S3_ACCESS_KEY:-buzz_dev}
-      MINIO_ROOT_PASSWORD: ${BUZZ_S3_SECRET_KEY:-buzz_dev_secret}
-    volumes:
-      - buzz_minio_data:/data
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 5s
-      timeout: 5s
-      retries: 12
-      start_period: 10s
-    restart: unless-stopped
-
-  buzz-minio-init:
-    image: minio/mc:latest
-    profiles: ["buzz"]
-    depends_on:
-      buzz-minio:
-        condition: service_healthy
-    environment:
-      BUZZ_S3_ACCESS_KEY: ${BUZZ_S3_ACCESS_KEY:-buzz_dev}
-      BUZZ_S3_SECRET_KEY: ${BUZZ_S3_SECRET_KEY:-buzz_dev_secret}
-      BUZZ_S3_BUCKET: ${BUZZ_S3_BUCKET:-buzz-media}
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - >-
-        mc alias set local http://buzz-minio:9000 "$${BUZZ_S3_ACCESS_KEY}" "$${BUZZ_S3_SECRET_KEY}"
-        && mc mb --ignore-existing "local/$${BUZZ_S3_BUCKET}"
-        && mc anonymous set none "local/$${BUZZ_S3_BUCKET}"
-    restart: "no"
-
   buzz-migrate:
     image: ghcr.io/block/buzz:latest
     profiles: ["buzz"]
@@ -458,14 +457,19 @@ services:
       BUZZ_RELAY_PRIVATE_KEY: ${BUZZ_RELAY_PRIVATE_KEY:-}
       # Must match the `buzz` service's own RELAY_URL exactly (community rows are
       # keyed by that string at seed time) — not the docker-internal hostname.
-      # 127.0.0.1, not localhost: Buzz Desktop's native-agent runtime (buzz-acp)
-      # always dials the local relay via 127.0.0.1 regardless of configured
-      # relay_url, and unlike NIP-42 (WS auth, aliases localhost/127.0.0.1),
-      # the NIP-98 HTTP bridge auth used by /query and /events does NOT alias
-      # them (deliberate, added in the multi-tenant rewrite) — so the
-      # community's canonical host has to literally be 127.0.0.1:3010 or every
-      # native agent's channel-discovery call 401s and the agent never gets to
-      # answer anything.
+      # 127.0.0.1, not localhost: buzz-acp's native-agent runtime always dials
+      # 127.0.0.1 regardless of configured relay_url, and NIP-98 HTTP bridge auth
+      # for /query and /events doesn't alias localhost/127.0.0.1 the way NIP-42
+      # WS auth does — so under localhost every native agent's ordinary /query
+      # call 401s. TRADEOFF (confirmed live in both directions on 2026-08-03 —
+      # see git history / conversation for the back-and-forth): Buzz Desktop's
+      # onboarding/profile-save call is separately hardcoded to sign against
+      # localhost regardless of this setting, so under 127.0.0.1 that call 401s
+      # and blocks onboarding for new/unmigrated identities. Chose agents working
+      # over onboarding — onboarding only blocks new identities, broken agents
+      # block everything the app is actually used for. If onboarding becomes the
+      # priority again, the fix is flipping this whole block to localhost, not
+      # more config tinkering.
       RELAY_URL: ${BUZZ_RELAY_URL:-ws://127.0.0.1:3010}
     depends_on:
       buzz-postgres:
@@ -478,23 +482,23 @@ services:
     # No host port published here anymore — see buzz-relay-proxy below, which
     # now owns host port 3010 for ALL host-side clients (browser, Buzz Desktop,
     # and Buzz Desktop's spawned native agents alike), not just buzz-agent-bridge.
-    # Reason: Buzz Desktop's native-agent-hosting subsystem connects via
-    # ws://127.0.0.1:3010 regardless of the community's configured relay URL
-    # (ws://localhost:3010) — a literal IP, not a hostname, so it can't be
-    # redirected via extra_hosts the way buzz-agent-bridge's own connection is.
-    # Routing every host-side client through this Host-rewriting proxy sidesteps
-    # that mismatch entirely instead of trying to make 127.0.0.1 and localhost
-    # both resolve to the same registered community (communities.host is
-    # unique — only one literal string can ever be registered).
+    # Routing every host-side client through the Host-rewriting proxy sidesteps
+    # the localhost/127.0.0.1 mismatch entirely instead of trying to make both
+    # resolve to the same registered community (communities.host is unique —
+    # only one literal string can ever be registered). See buzz-migrate's
+    # RELAY_URL comment for the localhost/127.0.0.1 tradeoff.
     environment:
       DATABASE_URL: postgres://buzz:${BUZZ_POSTGRES_PASSWORD:-buzz_dev}@buzz-postgres:5432/buzz
       REDIS_URL: redis://buzz-redis:6379
       BUZZ_BIND_ADDR: 0.0.0.0:3000
-      # See buzz-migrate's RELAY_URL comment — must be 127.0.0.1, not localhost.
+      # See buzz-migrate's RELAY_URL comment for the localhost/127.0.0.1 tradeoff.
       RELAY_URL: ${BUZZ_RELAY_URL:-ws://127.0.0.1:3010}
-      BUZZ_S3_ENDPOINT: http://buzz-minio:9000
-      BUZZ_S3_ACCESS_KEY: ${BUZZ_S3_ACCESS_KEY:-buzz_dev}
-      BUZZ_S3_SECRET_KEY: ${BUZZ_S3_SECRET_KEY:-buzz_dev_secret}
+      # Shares the stack-wide MinIO instance (see minio-init) rather than a
+      # dedicated buzz-minio — one object store instead of two. Credentials
+      # reuse DOCS_S3_* since they're the same server's root user.
+      BUZZ_S3_ENDPOINT: http://minio:9000
+      BUZZ_S3_ACCESS_KEY: ${DOCS_S3_ACCESS_KEY:-gcor_docs}
+      BUZZ_S3_SECRET_KEY: ${DOCS_S3_SECRET_KEY:-gcor_docs_secret}
       BUZZ_S3_BUCKET: ${BUZZ_S3_BUCKET:-buzz-media}
       BUZZ_GIT_REPO_PATH: /data/git
       # Stable signing key for the relay's own identity (kind:13534 membership
@@ -507,7 +511,7 @@ services:
     depends_on:
       buzz-redis:
         condition: service_healthy
-      buzz-minio-init:
+      minio-init:
         condition: service_completed_successfully
       buzz-migrate:
         condition: service_completed_successfully
@@ -525,12 +529,10 @@ services:
   # its network_mode) and host-side (browser, Buzz Desktop, and Buzz Desktop's
   # spawned native agents, via the published port below) — resolves to the
   # same community, regardless of whether they dial in as "localhost" or
-  # "127.0.0.1". The community's canonical host is 127.0.0.1:3010 (not
-  # localhost:3010): Buzz Desktop's native-agent runtime always dials the
-  # local relay via 127.0.0.1 regardless of configured relay_url, and the
-  # NIP-98 HTTP bridge auth used by /query and /events does not alias
-  # localhost/127.0.0.1 the way the WS NIP-42 auth does — see RELAY_URL
-  # comment on buzz-migrate.
+  # "127.0.0.1". Canonical host is currently 127.0.0.1:3010 — see the
+  # localhost/127.0.0.1 tradeoff comment on buzz-migrate's RELAY_URL; neither
+  # choice satisfies every Buzz Desktop module, this just picks the one that
+  # keeps native agents working.
   buzz-relay-proxy:
     image: nginx:alpine
     profiles: ["buzz"]
@@ -571,14 +573,12 @@ services:
     profiles: ["buzz"]
     # buzz-acp signs its NIP-42 auth event with a "relay" tag equal to whatever
     # --relay-url it was given, and the server requires that to match its own
-    # configured self-identity (ws://127.0.0.1:3010, see RELAY_URL comment on
-    # buzz-migrate) — not just be *reachable*. So this has to literally say
-    # 127.0.0.1:3010. Unlike "localhost", 127.0.0.1 is a literal IP — clients
-    # skip hosts-file/DNS resolution for literal IPs entirely, so the old
-    # extra_hosts trick (redirecting the hostname "localhost" to
-    # buzz-relay-proxy's static IP) can't redirect it. Sharing buzz-relay-proxy's
-    # network namespace instead makes "127.0.0.1" genuinely be buzz-relay-proxy
-    # from this container's point of view — no redirection needed.
+    # configured self-identity (see RELAY_URL comment on buzz-migrate) — not
+    # just be *reachable*. Shares buzz-relay-proxy's network namespace so
+    # "localhost"/"127.0.0.1" both trivially resolve to buzz-relay-proxy's own
+    # loopback from this container's point of view — either identity string
+    # would route correctly here; it's the *server's* canonical identity
+    # (RELAY_URL) that decides which one has to be used.
     network_mode: "service:buzz-relay-proxy"
     environment:
       # Required at runtime — validated by entrypoint.sh (not here: `${VAR:?}` would
@@ -586,7 +586,9 @@ services:
       # compose interpolates every service's env block regardless of --profile).
       BUZZ_RELAY_URL: ws://127.0.0.1:3010
       BUZZ_PRIVATE_KEY: ${BUZZ_AGENT_PRIVATE_KEY:-}
-      BUZZ_ACP_CHANNELS: ${BUZZ_KNOWLEDGE_CHANNELS:-}
+      # --channels is no longer set here — channel_supervisor.sh (the
+      # container's entrypoint) computes it from live channel membership and
+      # relaunches buzz-acp itself whenever that set changes.
       BUZZ_ACP_SUBSCRIBE: mentions
       BUZZ_ACP_RESPOND_TO: ${BUZZ_ACP_RESPOND_TO:-anyone}
       # reply_adapter.py — deterministic agent (see its file header): always
@@ -646,5 +648,4 @@ volumes:
   docs_minio_data:
   buzz_postgres_data:
   buzz_redis_data:
-  buzz_minio_data:
   buzz_git_data:

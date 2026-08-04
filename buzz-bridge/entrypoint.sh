@@ -2,7 +2,7 @@
 set -eu
 
 missing=""
-for var in BUZZ_PRIVATE_KEY OPENAI_COMPAT_API_KEY BUZZ_ACP_CHANNELS; do
+for var in BUZZ_PRIVATE_KEY OPENAI_COMPAT_API_KEY; do
     eval "val=\${$var:-}"
     if [ -z "$val" ]; then
         missing="$missing $var"
@@ -18,4 +18,8 @@ fi
 export BUZZ_ACP_AGENT_COMMAND="${BUZZ_ACP_AGENT_COMMAND:-/usr/local/bin/reply_adapter.py}"
 export BUZZ_ACP_AGENT_ARGS="${BUZZ_ACP_AGENT_ARGS:-}"
 
-exec /usr/local/bin/buzz-acp
+# channel_supervisor.sh computes --channels itself (every channel this
+# identity can see) and relaunches buzz-acp only when that set changes — see
+# its header comment for why a static BUZZ_ACP_CHANNELS list is no longer
+# needed.
+exec /usr/local/bin/channel_supervisor.sh

@@ -60,6 +60,7 @@ import io
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -260,17 +261,59 @@ def _get_s3_client():
     return _s3_client
 
 
-async def _store_original_to_s3(doc_id: str, filename: str, data: bytes) -> str | None:
-    """Persist the raw uploaded file to MinIO. Returns the object key, or None on failure/unconfigured."""
+_BUCKET_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{1,61}[a-z0-9]$")
+
+# Buckets we've already confirmed exist this process — avoids a round-trip
+# per ingest once a bucket has been seen.
+_known_buckets: set[str] = set()
+
+
+def _validate_bucket_name(name: str) -> str:
+    """S3/MinIO bucket naming rules: 3-63 chars, lowercase alphanumeric + hyphens,
+    no leading/trailing hyphen. Raises HTTPException on failure."""
+    if not _BUCKET_NAME_RE.match(name):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid bucket name '{name}': must be 3-63 characters, "
+                "lowercase letters, numbers and hyphens only, no leading/trailing hyphen"
+            ),
+        )
+    return name
+
+
+async def _ensure_bucket_exists(client, bucket: str) -> None:
+    """Create the bucket if it doesn't already exist. No-op once seen."""
+    if bucket in _known_buckets:
+        return
+    try:
+        await asyncio.to_thread(client.head_bucket, Bucket=bucket)
+    except Exception:
+        try:
+            await asyncio.to_thread(client.create_bucket, Bucket=bucket)
+        except Exception as exc:
+            # MinIO/S3 both raise a (different) "already exists/owned by you"
+            # error on a race here — anything else is a real failure.
+            if "BucketAlready" not in str(exc):
+                raise
+    _known_buckets.add(bucket)
+
+
+async def _store_original_to_s3(
+    doc_id: str, filename: str, data: bytes, bucket: str = S3_BUCKET,
+) -> str | None:
+    """Persist the raw uploaded file to MinIO, creating `bucket` if needed.
+    Returns the object key, or None on failure/unconfigured."""
     client = _get_s3_client()
     if client is None:
         return None
     key = f"{S3_ORIGINALS_PREFIX}{doc_id}/{filename}"
     try:
-        await asyncio.to_thread(client.put_object, Bucket=S3_BUCKET, Key=key, Body=data)
+        await _ensure_bucket_exists(client, bucket)
+        await asyncio.to_thread(client.put_object, Bucket=bucket, Key=key, Body=data)
         return key
     except Exception as exc:
-        logger.warning("S3 store of original file failed (doc_id=%s): %s", doc_id, exc)
+        logger.warning("S3 store of original file failed (doc_id=%s, bucket=%s): %s", doc_id, bucket, exc)
         return None
 
 
@@ -2050,6 +2093,27 @@ async def _neo4j_fetch_documents(doc_ids: list[str], limit: int | None = None) -
     ]
 
 
+@app.get("/api/buckets")
+async def api_buckets():
+    """List MinIO buckets, so the ingest UI can offer a picker alongside a
+    free-text name to create a new one (the ingest endpoint auto-creates
+    whatever bucket name it's given)."""
+    client = _get_s3_client()
+    if client is None:
+        return {"buckets": [], "default": S3_BUCKET}
+    try:
+        resp = await asyncio.to_thread(client.list_buckets)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"MinIO: {exc}")
+    buckets = [
+        {"name": b["Name"], "created_at": b["CreationDate"].isoformat()}
+        for b in resp.get("Buckets", [])
+    ]
+    if not any(b["name"] == S3_BUCKET for b in buckets):
+        buckets.insert(0, {"name": S3_BUCKET, "created_at": None})
+    return {"buckets": buckets, "default": S3_BUCKET}
+
+
 @app.get("/api/collections")
 async def api_collections():
     """List all Qdrant collections with Neo4j document stats."""
@@ -2736,6 +2800,7 @@ async def _ingest_bytes(
     access_level: str = "public",
     enable_docint: bool = False,
     collection: str = "",
+    bucket: str = "",
     valid_hours: float = 0.0,
 ) -> dict:
     """Core ingest pipeline shared by every entry point: extract -> chunk ->
@@ -2753,7 +2818,8 @@ async def _ingest_bytes(
     image_props: dict = {}
     docint_summary: dict = {}
 
-    storage_key = await _store_original_to_s3(doc_id, filename, data)
+    target_bucket = _validate_bucket_name(bucket.strip() or S3_BUCKET)
+    storage_key = await _store_original_to_s3(doc_id, filename, data, bucket=target_bucket)
 
     try:
         if ext in _MEDICAL_EXTS or _is_image(ext):
@@ -2796,7 +2862,7 @@ async def _ingest_bytes(
     target_collection = collection.strip() or QDRANT_COLLECTION
 
     if storage_key:
-        image_props["storage_bucket"] = S3_BUCKET
+        image_props["storage_bucket"] = target_bucket
         image_props["storage_key"] = storage_key
 
     from datetime import timedelta
@@ -2805,8 +2871,8 @@ async def _ingest_bytes(
         if valid_hours > 0 else None
     )
     logger.info(
-        "Ingest '%s': %d chunks (ext=%s, docint=%s, collection=%s, valid_to=%s)",
-        doc_title, len(chunks), ext, enable_docint, target_collection, valid_to,
+        "Ingest '%s': %d chunks (ext=%s, docint=%s, collection=%s, bucket=%s, valid_to=%s)",
+        doc_title, len(chunks), ext, enable_docint, target_collection, target_bucket, valid_to,
     )
 
     try:
@@ -2851,7 +2917,7 @@ async def _ingest_bytes(
     if docint_summary:
         result_json["docint"] = docint_summary
     if storage_key:
-        result_json["storage"] = {"bucket": S3_BUCKET, "key": storage_key}
+        result_json["storage"] = {"bucket": target_bucket, "key": storage_key}
     return result_json
 
 
@@ -2864,6 +2930,7 @@ async def api_ingest(
     access_level: str = Form("public"),
     enable_docint: str = Form("false"),   # "true" → run full Document Intelligence
     collection: str = Form(""),           # target Qdrant collection (defaults to QDRANT_COLLECTION)
+    bucket: str = Form(""),               # target MinIO bucket (defaults to S3_BUCKET, created if missing)
     valid_hours: float = Form(0.0),       # >0 → chunk expires after this many hours
 ):
     """JSON-returning ingest endpoint used by the knowledge UI."""
@@ -2874,7 +2941,7 @@ async def api_ingest(
         background_tasks=background_tasks,
         title=title, agent_id=agent_id, access_level=access_level,
         enable_docint=enable_docint.lower() in ("true", "1", "yes"),
-        collection=collection, valid_hours=valid_hours,
+        collection=collection, bucket=bucket, valid_hours=valid_hours,
     )
 
 
