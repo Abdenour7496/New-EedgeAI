@@ -396,12 +396,27 @@ services:
 
   # ── Monitoring ────────────────────────────────────────────────────────────────
 
+  falkordb-exporter:
+    image: oliver006/redis_exporter:latest
+    environment:
+      REDIS_ADDR: redis://falkordb:6379
+      REDIS_PASSWORD: ${FALKORDB_PASSWORD:-}
+    depends_on:
+      falkordb:
+        condition: service_healthy
+    restart: unless-stopped
+
   prometheus:
     image: prom/prometheus
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
     ports:
       - "9090:9090"
+    depends_on:
+      graphiti:
+        condition: service_healthy
+      falkordb-exporter:
+        condition: service_started
     restart: unless-stopped
 
   grafana:

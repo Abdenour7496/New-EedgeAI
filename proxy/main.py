@@ -91,17 +91,17 @@ METRIC_RAG_REQUESTS = Counter(
 )
 METRIC_RAG_DURATION = Histogram(
     "gcor_rag_duration_seconds",
-    "End-to-end GCOR pipeline latency (embed → Qdrant → Neo4j → context build)",
+    "End-to-end Graphiti retrieval and context-build latency",
     buckets=[0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0],
 )
-METRIC_QDRANT_HITS = Histogram(
-    "gcor_qdrant_hits",
-    "Number of Qdrant hits returned per RAG request (after cognitive filters)",
+METRIC_GRAPHITI_FACTS = Histogram(
+    "gcor_graphiti_facts",
+    "Number of Graphiti facts returned per RAG request",
     buckets=[0, 1, 2, 3, 4, 5, 6, 8, 10, 15, 20],
 )
-METRIC_NEO4J_RECORDS = Histogram(
-    "gcor_neo4j_records",
-    "Number of Neo4j graph records expanded per RAG request",
+METRIC_CONTEXT_RECORDS = Histogram(
+    "gcor_context_records",
+    "Number of knowledge records added to the LLM context",
     buckets=[0, 1, 2, 5, 10, 15, 20, 30, 50],
 )
 
@@ -140,7 +140,7 @@ METRIC_INGEST_CHUNKS = Histogram(
 # Collection management
 METRIC_COLLECTION_OPS = Counter(
     "gcor_collection_ops_total",
-    "Qdrant collection management operations",
+    "Graphiti group management operations",
     ["operation"],
 )
 
@@ -1992,12 +1992,12 @@ async def _run_chat_completion(body: dict, rag_collection: str | None):
             # ── Step 2: Graphiti hybrid temporal retrieval ──────────────────
             raw_hits, graph_records = await graphiti_search(query, rag_collection)
             qdrant_hits = _filter_hits(raw_hits)
-            METRIC_QDRANT_HITS.observe(len(qdrant_hits))
+            METRIC_GRAPHITI_FACTS.observe(len(qdrant_hits))
             logger.info(
                 "Graphiti[%s]: %d facts → %d after policy filters",
                 rag_collection or GRAPHITI_GROUP_ID, len(raw_hits), len(qdrant_hits),
             )
-            METRIC_NEO4J_RECORDS.observe(len(graph_records))
+            METRIC_CONTEXT_RECORDS.observe(len(graph_records))
             logger.info("Graphiti: %d temporal graph records retrieved", len(graph_records))
 
             # ── Step 2c: Belief conflict resolution ─────────────────────────

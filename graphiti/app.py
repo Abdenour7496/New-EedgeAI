@@ -1,9 +1,11 @@
 import os
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from pydantic import BaseModel, Field
 
 from graphiti_core import Graphiti
@@ -84,10 +86,32 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="eedgeai Graphiti API", lifespan=lifespan)
 
+INGEST_REQUESTS = Counter(
+    "graphiti_ingest_requests_total", "Graphiti ingestion requests", ["status"]
+)
+INGEST_DURATION = Histogram(
+    "graphiti_ingest_duration_seconds", "Graphiti ingestion latency"
+)
+SEARCH_REQUESTS = Counter(
+    "graphiti_search_requests_total", "Graphiti search requests", ["status"]
+)
+SEARCH_DURATION = Histogram(
+    "graphiti_search_duration_seconds", "Graphiti search latency"
+)
+SEARCH_FACTS = Histogram(
+    "graphiti_search_facts", "Facts returned by Graphiti search",
+    buckets=[0, 1, 2, 3, 5, 8, 10, 20, 50],
+)
+
 
 @app.get("/healthcheck")
 async def healthcheck():
     return {"status": "healthy", "backend": "falkordb"}
+
+
+@app.get("/metrics")
+async def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.post("/messages", status_code=201)
@@ -106,17 +130,34 @@ async def add_messages(request: AddMessagesRequest):
         for message in request.messages:
             await ingest(message)
 
-    await ingest_all()
+    started = time.perf_counter()
+    try:
+        await ingest_all()
+        INGEST_REQUESTS.labels(status="success").inc()
+    except Exception:
+        INGEST_REQUESTS.labels(status="error").inc()
+        raise
+    finally:
+        INGEST_DURATION.observe(time.perf_counter() - started)
     return {"success": True, "message": "Messages ingested"}
 
 
 @app.post("/search")
 async def search(request: SearchQuery):
-    edges = await app.state.graphiti.search(
-        group_ids=request.group_ids,
-        query=request.query,
-        num_results=request.max_facts,
-    )
+    started = time.perf_counter()
+    try:
+        edges = await app.state.graphiti.search(
+            group_ids=request.group_ids,
+            query=request.query,
+            num_results=request.max_facts,
+        )
+        SEARCH_REQUESTS.labels(status="success").inc()
+        SEARCH_FACTS.observe(len(edges))
+    except Exception:
+        SEARCH_REQUESTS.labels(status="error").inc()
+        raise
+    finally:
+        SEARCH_DURATION.observe(time.perf_counter() - started)
     return {"facts": [
         {
             "uuid": edge.uuid,
