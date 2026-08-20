@@ -82,13 +82,9 @@
   },
   "mcp": {
     "servers": {
-      "qdrant-memory": {
-        "type": "sse",
-        "url": "http://mcp-qdrant:8765/sse"
-      },
-      "neo4j-graph": {
-        "type": "sse",
-        "url": "http://mcp-neo4j:8766/sse"
+      "graphiti-memory": {
+        "type": "http",
+        "url": "http://graphiti-mcp:8000/mcp/"
       }
     }
   },

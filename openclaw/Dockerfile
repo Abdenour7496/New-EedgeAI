@@ -17,19 +17,15 @@ RUN mkdir -p /home/node/.claude && \
     ln -sf /home/node/.claude/.claude.json /home/node/.claude.json && \
     chown -R node:node /home/node/.claude /home/node/.claude.json
 
-# Install Neo4j, Qdrant, and MinIO Node.js drivers alongside the driver CLI
-# scripts. Files land in /opt/oc-drivers so they don't collide with OpenClaw
-# internals.
+# Install document ingestion and MinIO dependencies outside OpenClaw internals.
 WORKDIR /opt/oc-drivers
 COPY openclaw/package.json .
 RUN npm install --production && npm cache clean --force
 
-COPY openclaw/neo4j.js openclaw/qdrant.js openclaw/ingest.js openclaw/pdf.js openclaw/image-extractor.js ./
+COPY openclaw/ingest.js openclaw/pdf.js openclaw/image-extractor.js ./
 
 # Expose the scripts as globally callable commands.
-RUN chmod +x neo4j.js qdrant.js ingest.js pdf.js && \
-    ln -s /opt/oc-drivers/neo4j.js   /usr/local/bin/neo4j-cli  && \
-    ln -s /opt/oc-drivers/qdrant.js  /usr/local/bin/qdrant-cli && \
+RUN chmod +x ingest.js pdf.js && \
     ln -s /opt/oc-drivers/ingest.js  /usr/local/bin/ingest-cli && \
     ln -s /opt/oc-drivers/pdf.js     /usr/local/bin/pdf-cli
 

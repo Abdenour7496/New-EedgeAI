@@ -2,9 +2,8 @@
 /**
  * Document ingest CLI for OpenClaw — GCOR pipeline.
  *
- * Reads a file (or stdin), chunks the text, creates Document + Chunk nodes
- * in Neo4j, embeds each chunk, and upserts it to Qdrant with the Neo4j
- * elementId so the GCOR proxy can traverse from vector hits to graph context.
+ * Reads a file (or stdin), chunks the text, and queues each chunk as a Graphiti
+ * episode. Graphiti extracts temporal entities and facts into FalkorDB.
  * Also persists the original input to MinIO (best-effort — see
  * storeOriginalToS3) under the same originals/<document_id>/<filename>
  * convention proxy/main.py uses, so a document is findable in object storage
@@ -22,7 +21,7 @@
  *   ingest-cli <file> --title "My Doc"      override document title
  *   ingest-cli <file> --agent-id "a1"       scope to an agent partition
  *   ingest-cli <file> --access-level restricted
- *   ingest-cli <file> --collection myIndex  target a different Qdrant collection
+ *   ingest-cli <file> --collection myGroup  target a different Graphiti group
  *   ingest-cli <file> --chunk-size 1500     chars per chunk (default 2000)
  *   ingest-cli <file> --chunk-overlap 200   overlap chars (default 200)
  *   echo "text" | ingest-cli --stdin --title "pasted text"
@@ -37,32 +36,13 @@ const path    = require('path');
 const http    = require('http');
 const https   = require('https');
 const crypto  = require('crypto');
-const neo4j   = require('neo4j-driver');
-const { QdrantClient } = require('@qdrant/js-client-rest');
 const { Client: MinioClient } = require('minio');
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
-const NEO4J_URI       = process.env.NEO4J_URI        || 'bolt://neo4j:7687';
-const NEO4J_USER      = process.env.NEO4J_USER        || 'neo4j';
-const NEO4J_PASSWORD  = process.env.NEO4J_PASSWORD    || 'test1234';
-const NEO4J_DATABASE  = process.env.NEO4J_DATABASE    || 'neo4j';
-const QDRANT_URL      = process.env.QDRANT_URL        || 'http://qdrant:6333';
-const OPENAI_API_KEY  = process.env.OPENAI_API_KEY    || '';
-const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL   || 'text-embedding-3-small';
 const DEFAULT_ACCESS  = process.env.DEFAULT_ACCESS_LEVEL || 'public';
-const DEFAULT_COLLECTION = process.env.QDRANT_COLLECTION || 'documents';
-
-// Embedding backend — mirrors proxy/main.py's EMBEDDING_BACKEND/_embed_batch
-// exactly (same Ollama OpenAI-compatible /v1/embeddings shape), defaulting to
-// 'ollama' for the same reason the proxy's compose service does: the shared
-// "documents" Qdrant collection is built from nomic-embed-text (768-dim), not
-// an OpenAI model (1536-dim) — using OpenAI here would both need billing
-// credits ingest-cli has no control over *and* upsert vectors the wrong
-// dimension for the collection it's writing into.
-const EMBEDDING_BACKEND     = process.env.EMBEDDING_BACKEND     || 'ollama';
-const OLLAMA_BASE_URL       = process.env.OLLAMA_BASE_URL       || 'http://ollama:11434';
-const OLLAMA_EMBEDDING_MODEL = process.env.OLLAMA_EMBEDDING_MODEL || 'nomic-embed-text';
+const DEFAULT_COLLECTION = process.env.GRAPHITI_GROUP_ID || 'documents';
+const GRAPHITI_URL        = (process.env.GRAPHITI_URL || 'http://graphiti:8000').replace(/\/$/, '');
 
 // Document storage (MinIO, S3-compatible) — same bucket/key convention as
 // proxy/main.py's _store_original_to_s3, so a document ingested via either
@@ -132,8 +112,8 @@ async function extractText(fp, rawBuffer) {
       // unpdf, not pdf-parse: pdf-parse@1.1.4 vendors a hardcoded 2018-era
       // pdfjs-dist (v1.10.100) that breaks on ANY PDF — not just malformed
       // ones — once Node's own 'http' module has been loaded anywhere in the
-      // process (true here: neo4j-driver/minio/qdrant-client/image-extractor
-      // all pull it in transitively before this code ever runs), throwing
+      // process (true here: MinIO and the image extractor load it before this
+      // code runs), throwing
       // "bad XRef entry" on perfectly valid input. unpdf wraps a current,
       // actively-maintained pdfjs-dist build with no such issue.
       const { extractText: extractPdfText, getDocumentProxy } = require('unpdf');
@@ -190,57 +170,6 @@ function chunkText(text, size = CHUNK_SIZE, overlap = CHUNK_OVERLAP) {
   return chunks;
 }
 
-// ── Embedding ─────────────────────────────────────────────────────────────────
-//
-// Both backends speak the same OpenAI-compatible /v1/embeddings request/
-// response shape (Ollama included), so one request function covers both —
-// just the transport (https vs http) and target host/auth differ.
-
-function embedTexts(texts) {
-  if (EMBEDDING_BACKEND === 'ollama') {
-    const u = new URL(`${OLLAMA_BASE_URL}/v1/embeddings`);
-    return embeddingsRequest(http, {
-      hostname: u.hostname,
-      port:     u.port || 80,
-      path:     u.pathname,
-      method:   'POST',
-      headers:  { 'Content-Type': 'application/json' },
-    }, { input: texts, model: OLLAMA_EMBEDDING_MODEL });
-  }
-  if (!OPENAI_API_KEY) return Promise.reject(new Error('OPENAI_API_KEY is not set'));
-  return embeddingsRequest(https, {
-    hostname: 'api.openai.com',
-    path:     '/v1/embeddings',
-    method:   'POST',
-    headers:  { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-  }, { input: texts, model: EMBEDDING_MODEL });
-}
-
-function embeddingsRequest(transport, options, payload) {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify(payload);
-    const req = transport.request(
-      { ...options, headers: { ...options.headers, 'Content-Length': Buffer.byteLength(body) } },
-      res => {
-        let data = '';
-        res.on('data', d => { data += d; });
-        res.on('end', () => {
-          try {
-            const parsed = JSON.parse(data);
-            if (parsed.error) return reject(new Error(parsed.error.message || JSON.stringify(parsed.error)));
-            // Return embeddings in index order
-            const sorted = parsed.data.sort((a, b) => a.index - b.index);
-            resolve(sorted.map(d => d.embedding));
-          } catch (e) { reject(e); }
-        });
-      }
-    );
-    req.on('error', reject);
-    req.write(body);
-    req.end();
-  });
-}
-
 // ── MinIO (S3-compatible object storage) ───────────────────────────────────────
 
 let _minioClient = null;
@@ -291,142 +220,32 @@ async function storeOriginalToS3(documentId, filename, buffer, bucket = S3_BUCKE
   }
 }
 
-// ── Neo4j ────────────────────────────────────────────────────────────────────
-
-async function neo4jIngest(documentId, title, source, chunks, agentId, accessLevel, imageProps = {}) {
-  const driver = neo4j.driver(NEO4J_URI, neo4j.auth.basic(NEO4J_USER, NEO4J_PASSWORD));
-  try {
-    await driver.verifyConnectivity();
-    const session = driver.session({ database: NEO4J_DATABASE });
-    try {
-      const now = new Date().toISOString();
-
-      // Upsert the Document node, then merge any image-specific metadata fields
-      const docResult = await session.run(
-        `MERGE (d:Document {document_id: $document_id})
-         ON CREATE SET d.created_at = $created_at
-         SET d.title        = $title,
-             d.source       = $source,
-             d.agent_id     = $agent_id,
-             d.access_level = $access_level,
-             d.chunk_count  = $chunk_count
-         SET d += $image_props
-         RETURN elementId(d) AS eid`,
-        {
-          document_id:  documentId,
-          title,
-          source,
-          agent_id:     agentId,
-          access_level: accessLevel,
-          chunk_count:  neo4j.int(chunks.length),
-          created_at:   now,
-          image_props:  imageProps,
-        }
-      );
-      const docEid = docResult.records[0].get('eid');
-
-      // Upsert Chunk nodes and link them with HAS_CHUNK
-      const chunkEids = [];
-      for (let i = 0; i < chunks.length; i++) {
-        const chunkId = `${documentId}-chunk-${i}`;
-        const chunkResult = await session.run(
-          `MATCH (d:Document {document_id: $document_id})
-           MERGE (c:Chunk {chunk_id: $chunk_id})
-           ON CREATE SET c.created_at = $created_at
-           SET c.text           = $text,
-               c.position       = $position,
-               c.document_id    = $document_id,
-               c.document_title = $title,
-               c.agent_id       = $agent_id,
-               c.access_level   = $access_level,
-               c.confidence     = 1.0
-           MERGE (d)-[:HAS_CHUNK]->(c)
-           RETURN elementId(c) AS eid`,
-          {
-            document_id: documentId,
-            chunk_id:    chunkId,
-            text:        chunks[i],
-            position:    neo4j.int(i),
-            title,
-            agent_id:    agentId,
-            access_level: accessLevel,
-            created_at:  now,
-          }
-        );
-        chunkEids.push(chunkResult.records[0].get('eid'));
-      }
-
-      // Link consecutive chunks with :NEXT for traversal
-      for (let i = 0; i < chunkEids.length - 1; i++) {
-        await session.run(
-          `MATCH (a:Chunk) WHERE elementId(a) = $a
-           MATCH (b:Chunk) WHERE elementId(b) = $b
-           MERGE (a)-[:NEXT]->(b)`,
-          { a: chunkEids[i], b: chunkEids[i + 1] }
-        );
-      }
-
-      return { docEid, chunkEids };
-    } finally {
-      await session.close();
-    }
-  } finally {
-    await driver.close();
-  }
-}
-
-// ── Qdrant ───────────────────────────────────────────────────────────────────
-
-async function qdrantIngest(collection, chunks, chunkEids, documentId, title, agentId, accessLevel) {
-  const client = new QdrantClient({ url: QDRANT_URL });
-  const now    = new Date().toISOString();
-
-  // Batch embed (max 96 texts per OpenAI call)
-  const BATCH = 96;
-  const allVectors = [];
-  for (let i = 0; i < chunks.length; i += BATCH) {
-    const batch = chunks.slice(i, i + BATCH);
-    const vecs  = await embedTexts(batch);
-    allVectors.push(...vecs);
-  }
-
-  // Ensure collection exists
-  try {
-    await client.getCollection(collection);
-  } catch {
-    await client.createCollection(collection, {
-      vectors: { size: allVectors[0].length, distance: 'Cosine' },
-    });
-  }
-
-  // Upsert points
-  const points = chunks.map((text, i) => ({
-    id:      md5Uuid(chunkEids[i]),
-    vector:  allVectors[i],
-    payload: {
-      text,
-      neo4j_element_id: chunkEids[i],
-      node_type:        'Chunk',
-      document_id:      documentId,
-      document_title:   title,
-      position:         i,
-      agent_id:         agentId,
-      access_level:     accessLevel,
-      confidence:       1.0,
-      valid_from:       now,
-      valid_to:         null,
-    },
-  }));
-
-  await client.upsert(collection, { points, wait: true });
-  return points.length;
-}
-
-// ── UUID from MD5 (Qdrant needs UUID format) ──────────────────────────────────
+// ── Stable UUID ───────────────────────────────────────────────────────────────
 
 function md5Uuid(str) {
   const h = crypto.createHash('md5').update(str).digest('hex');
   return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20,32)}`;
+}
+
+async function graphitiIngest(groupId, chunks, documentId, title, source, agentId, accessLevel) {
+  const timestamp = new Date().toISOString();
+  const messages = chunks.map((content, position) => ({
+    name: `${title} — chunk ${position + 1}`,
+    role_type: 'system',
+    role: 'document',
+    timestamp,
+    source_description: source,
+    content: `Document: ${title}\nSource: ${source}\nDocument ID: ${documentId}\n` +
+      `Chunk: ${position + 1}/${chunks.length}\nAgent: ${agentId || 'shared'}\n` +
+      `Access: ${accessLevel}\n\n${content}`,
+  }));
+  const response = await fetch(`${GRAPHITI_URL}/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ group_id: groupId, messages }),
+  });
+  if (!response.ok) throw new Error(`Graphiti ingest failed (${response.status}): ${await response.text()}`);
+  return messages.length;
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
@@ -448,7 +267,7 @@ function md5Uuid(str) {
         '  --title <str>            Document title (default: filename)',
         '  --agent-id <str>         Agent partition (default: shared)',
         '  --access-level <str>     public | restricted | agent:<id> (default: public)',
-        '  --collection <str>       Qdrant collection (default: documents)',
+        '  --collection <str>       Graphiti group (default: documents)',
         '  --chunk-size <n>         Characters per chunk (default: 2000)',
         '  --chunk-overlap <n>      Overlap characters (default: 200)',
         '  --stdin                  Read from stdin instead of a file',
@@ -495,7 +314,7 @@ function md5Uuid(str) {
         (_imageMetadata.modality ? ` / ${_imageMetadata.modality}` : '') + '\n');
     }
 
-    // Flatten image metadata into Neo4j-safe scalar props (no nested objects)
+    // Flatten image metadata for storage metadata (no nested objects).
     const imageProps = {};
     if (_imageMetadata) {
       for (const [k, v] of Object.entries(_imageMetadata)) {
@@ -514,24 +333,18 @@ function md5Uuid(str) {
       imageProps.storage_key    = storageKey;
     }
 
-    // Neo4j
-    process.stderr.write('[ingest] Writing to Neo4j...\n');
-    const { docEid, chunkEids } = await neo4jIngest(
-      documentId, title, source, textChunks, agentId, accessLevel, imageProps
+    process.stderr.write('[ingest] Queuing episodes in Graphiti/FalkorDB...\n');
+    const upserted = await graphitiIngest(
+      collection, textChunks, documentId, title, source, agentId, accessLevel
     );
-
-    // Qdrant
-    process.stderr.write('[ingest] Embedding and writing to Qdrant...\n');
-    const upserted = await qdrantIngest(collection, textChunks, chunkEids, documentId, title, agentId, accessLevel);
 
     const result = {
       status:        'ok',
       document_id:   documentId,
-      document_eid:  docEid,
       title,
       source,
       chunks:        textChunks.length,
-      qdrant_points: upserted,
+      graphiti_episodes: upserted,
       collection,
       ..._imageMetadata && { image_metadata: _imageMetadata },
       ...storageKey && { storage: { bucket: S3_BUCKET, key: storageKey } },

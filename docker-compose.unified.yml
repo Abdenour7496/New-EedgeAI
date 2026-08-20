@@ -1,51 +1,88 @@
-x-neo4j-credentials: &neo4j-creds
-  NEO4J_URI: bolt://neo4j:7687
-  NEO4J_USER: neo4j
-  NEO4J_PASSWORD: ${NEO4J_PASSWORD:-test1234}
-
 services:
 
   # ── Data stores ───────────────────────────────────────────────────────────────
 
-  neo4j:
-    image: neo4j:5
+  falkordb:
+    image: falkordb/falkordb:latest
     ports:
-      - "7474:7474"
-      - "7687:7687"
+      - "6379:6379"
+      - "3001:3000"
     environment:
-      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-test1234}
+      FALKORDB_PASSWORD: ${FALKORDB_PASSWORD:-}
+      REDIS_ARGS: --appendonly yes --appendfsync everysec
+      BROWSER: "1"
     volumes:
-      - neo4j_data:/data
+      - falkordb_data:/var/lib/falkordb/data
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:7474"]
-      interval: 15s
+      test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+      interval: 10s
       timeout: 5s
-      retries: 8
-      start_period: 30s
-    restart: unless-stopped
-
-  neo4j-exporter:
-    build: ./neo4j-exporter
-    environment:
-      <<: *neo4j-creds
-      NEO4J_DATABASE: neo4j
-    depends_on:
-      neo4j:
-        condition: service_healthy
-    restart: unless-stopped
-
-  qdrant:
-    image: qdrant/qdrant:latest
-    ports:
-      - "6333:6333"
-    volumes:
-      - qdrant_data:/qdrant/storage
-    healthcheck:
-      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/localhost/6333'"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
+      retries: 12
       start_period: 10s
+    restart: unless-stopped
+
+  graphiti:
+    build: ./graphiti
+    ports:
+      - "8000:8000"
+    environment:
+      OPENAI_BASE_URL: ${GRAPHITI_API_BASE_URL:-http://ollama:11434/v1}
+      OPENAI_API_KEY: ${GRAPHITI_API_KEY:-ollama}
+      MODEL_NAME: ${GRAPHITI_MODEL:-qwen2.5:7b}
+      EMBEDDING_MODEL_NAME: ${GRAPHITI_EMBEDDING_MODEL:-nomic-embed-text}
+      EMBEDDING_DIM: ${GRAPHITI_EMBEDDING_DIM:-768}
+      FALKORDB_HOST: falkordb
+      FALKORDB_PORT: "6379"
+      FALKORDB_DATABASE: ${FALKORDB_DATABASE:-eedgeai}
+      db_backend: falkordb
+      # Graphiti 0.22.0 marks these optional fields as required during settings
+      # validation even for DB_BACKEND=falkordb. They are never connected to.
+      NEO4J_URI: bolt://unused:7687
+      NEO4J_USER: unused
+      NEO4J_PASSWORD: unused
+      GRAPHITI_TELEMETRY_ENABLED: "false"
+      SEMAPHORE_LIMIT: ${GRAPHITI_SEMAPHORE_LIMIT:-2}
+    depends_on:
+      falkordb:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthcheck')"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 45s
+    restart: unless-stopped
+
+  graphiti-mcp:
+    image: zepai/knowledge-graph-mcp:standalone
+    environment:
+      CONFIG_PATH: /app/mcp/config/config.yaml
+      OPENAI_API_URL: ${GRAPHITI_API_BASE_URL:-http://ollama:11434/v1}
+      OPENAI_API_KEY: ${GRAPHITI_API_KEY:-ollama}
+      MODEL_NAME: ${GRAPHITI_MODEL:-qwen2.5:7b}
+      EMBEDDER_MODEL: ${GRAPHITI_EMBEDDING_MODEL:-nomic-embed-text}
+      EMBEDDING_DIM: ${GRAPHITI_EMBEDDING_DIM:-768}
+      FALKORDB_URI: redis://falkordb:6379
+      FALKORDB_PASSWORD: ${FALKORDB_PASSWORD:-}
+      FALKORDB_DATABASE: ${FALKORDB_DATABASE:-eedgeai}
+      GRAPHITI_GROUP_ID: ${GRAPHITI_GROUP_ID:-documents}
+      GRAPHITI_TELEMETRY_ENABLED: "false"
+      SEMAPHORE_LIMIT: ${GRAPHITI_SEMAPHORE_LIMIT:-2}
+    volumes:
+      - ./graphiti-mcp/config.yaml:/app/mcp/config/config.yaml:ro
+    depends_on:
+      falkordb:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 45s
     restart: unless-stopped
 
   # ── Ollama (local LLM) ────────────────────────────────────────────────────────
@@ -84,45 +121,9 @@ services:
       - |
         ollama pull ${OLLAMA_MODEL:-llama3.2} &&
         ollama pull ${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text} &&
+        ollama pull ${GRAPHITI_MODEL:-qwen2.5:7b} &&
         ollama pull ${OLLAMA_VISION_MODEL:-llava:7b}
     restart: "no"
-
-  # ── MCP servers (SSE) — expose graph + vector DBs to OpenClaw ─────────────────
-
-  mcp-qdrant:
-    build: ./mcp-servers/qdrant
-    environment:
-      <<: *neo4j-creds
-      QDRANT_URL: http://qdrant:6333
-      COLLECTION_NAME: ${QDRANT_COLLECTION:-documents}
-      QDRANT_MCP_HOST: 0.0.0.0
-      QDRANT_MCP_PORT: "8765"
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
-      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
-      # Embedding backend — must match proxy to avoid dimension mismatch
-      EMBEDDING_BACKEND: ${EMBEDDING_BACKEND:-ollama}
-      OLLAMA_BASE_URL: http://ollama:11434
-      OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}
-      DEFAULT_ACCESS_LEVEL: ${DEFAULT_ACCESS_LEVEL:-public}
-    depends_on:
-      qdrant:
-        condition: service_healthy
-      neo4j:
-        condition: service_healthy
-    restart: unless-stopped
-
-  mcp-neo4j:
-    build: ./mcp-servers/neo4j
-    environment:
-      <<: *neo4j-creds
-      NEO4J_DATABASE: neo4j
-      NEO4J_MCP_SERVER_HOST: 0.0.0.0
-      NEO4J_MCP_SERVER_PORT: "8766"
-      DEFAULT_ACCESS_LEVEL: ${DEFAULT_ACCESS_LEVEL:-public}
-    depends_on:
-      neo4j:
-        condition: service_healthy
-    restart: unless-stopped
 
   openclaw-config-init:
     image: alpine:3.20
@@ -147,9 +148,7 @@ services:
     depends_on:
       openclaw-config-init:
         condition: service_completed_successfully
-      mcp-qdrant:
-        condition: service_started
-      mcp-neo4j:
+      graphiti-mcp:
         condition: service_started
     ports:
       - "18789:18789"
@@ -157,7 +156,6 @@ services:
       - "18801:18801"
       - "9091:9091"
     environment:
-      <<: *neo4j-creds
       # Deliberately NOT set here (unlike the proxy service, which has its own
       # copy for RAG/vision calls): the bundled `claude` CLI prefers
       # ANTHROPIC_API_KEY over an OAuth/subscription login whenever it's
@@ -178,8 +176,8 @@ services:
       OPENCLAW_WORKSPACE_DIR: /home/node/.openclaw/workspace
       OPENCLAW_DOCKER_APT_PACKAGES: ${OPENCLAW_DOCKER_APT_PACKAGES:-}
       OPENCLAW_DISABLE_BONJOUR: "true"
-      QDRANT_URL: http://qdrant:6333
-      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-documents}
+      GRAPHITI_URL: http://graphiti:8000
+      GRAPHITI_GROUP_ID: ${GRAPHITI_GROUP_ID:-documents}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
       # ingest-cli embedding backend — mirrors the proxy's own copy of these
       # vars so both write vectors of the same dimension into the shared
@@ -214,14 +212,11 @@ services:
     ports:
       - "5001:5001"
     depends_on:
-      neo4j:
-        condition: service_healthy
-      qdrant:
+      graphiti:
         condition: service_healthy
       ollama:
         condition: service_healthy
     environment:
-      <<: *neo4j-creds
       # LLM backend — openai | anthropic | ollama | openclaw | copilot
       LLM_BACKEND: ${LLM_BACKEND:-anthropic}
       VISION_BACKEND: ${VISION_BACKEND:-anthropic}
@@ -242,10 +237,10 @@ services:
       # Embedding
       EMBEDDING_BACKEND: ${EMBEDDING_BACKEND:-ollama}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
-      # Qdrant
-      QDRANT_URL: http://qdrant:6333
-      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-documents}
-      QDRANT_TOP_K: ${QDRANT_TOP_K:-8}
+      # Graphiti temporal knowledge graph backed by FalkorDB
+      GRAPHITI_URL: http://graphiti:8000
+      GRAPHITI_GROUP_ID: ${GRAPHITI_GROUP_ID:-documents}
+      GRAPHITI_TOP_K: ${GRAPHITI_TOP_K:-8}
       # OpenClaw backend
       OPENCLAW_BASE_URL: ${OPENCLAW_BASE_URL:-http://openclaw:18799/v1}
       OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:-}
@@ -255,10 +250,6 @@ services:
       CONFIDENCE_THRESHOLD: ${CONFIDENCE_THRESHOLD:-0.0}
       AGENT_ID: ${AGENT_ID:-}
       DEFAULT_ACCESS_LEVEL: ${DEFAULT_ACCESS_LEVEL:-public}
-      # Buzz knowledge bridge — /v1/buzz/chat/completions stays closed (503) unless
-      # BUZZ_BRIDGE_API_KEY is set, so this is a no-op for the default (non-buzz) stack.
-      BUZZ_BRIDGE_API_KEY: ${BUZZ_BRIDGE_API_KEY:-}
-      BUZZ_ALLOWED_COLLECTIONS: ${BUZZ_ALLOWED_COLLECTIONS:-}
       # Document storage (MinIO) — best-effort; ingestion still works if unset/unreachable.
       S3_ENDPOINT_URL: http://minio:9000
       S3_ACCESS_KEY: ${DOCS_S3_ACCESS_KEY:-gcor_docs}
@@ -307,11 +298,6 @@ services:
       DOCS_S3_ACCESS_KEY: ${DOCS_S3_ACCESS_KEY:-gcor_docs}
       DOCS_S3_SECRET_KEY: ${DOCS_S3_SECRET_KEY:-gcor_docs_secret}
       DOCS_S3_BUCKET: ${DOCS_S3_BUCKET:-documents}
-      # Buzz media and Open WebUI file storage share this same MinIO instance
-      # (see buzz's BUZZ_S3_ENDPOINT and openwebui's S3_ENDPOINT_URL below) —
-      # one object store for the whole stack instead of a separate MinIO per
-      # service. Pre-created here since neither app auto-creates its bucket.
-      BUZZ_S3_BUCKET: ${BUZZ_S3_BUCKET:-buzz-media}
       OPENWEBUI_S3_BUCKET: ${OPENWEBUI_S3_BUCKET:-openwebui}
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -319,8 +305,6 @@ services:
         mc alias set local http://minio:9000 "$${DOCS_S3_ACCESS_KEY}" "$${DOCS_S3_SECRET_KEY}"
         && mc mb --ignore-existing "local/$${DOCS_S3_BUCKET}"
         && mc anonymous set none "local/$${DOCS_S3_BUCKET}"
-        && mc mb --ignore-existing "local/$${BUZZ_S3_BUCKET}"
-        && mc anonymous set none "local/$${BUZZ_S3_BUCKET}"
         && mc mb --ignore-existing "local/$${OPENWEBUI_S3_BUCKET}"
         && mc anonymous set none "local/$${OPENWEBUI_S3_BUCKET}"
     restart: "no"
@@ -344,7 +328,7 @@ services:
       S3_FAILED_PREFIX: failed/
       PROXY_INGEST_URL: http://proxy:5001/api/ingest
       POLL_INTERVAL_SECONDS: ${INGEST_WATCH_INTERVAL_SECONDS:-10}
-      INGEST_COLLECTION: ${QDRANT_COLLECTION:-documents}
+      INGEST_COLLECTION: ${GRAPHITI_GROUP_ID:-documents}
       INGEST_ENABLE_DOCINT: ${INGEST_ENABLE_DOCINT:-false}
       INGEST_ACCESS_LEVEL: ${DEFAULT_ACCESS_LEVEL:-public}
     restart: unless-stopped
@@ -410,211 +394,6 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
-  # ── Buzz — human and agent collaboration relay (opt in: --profile buzz) ────
-
-  buzz-postgres:
-    image: postgres:17-alpine
-    profiles: ["buzz"]
-    environment:
-      POSTGRES_USER: buzz
-      POSTGRES_PASSWORD: ${BUZZ_POSTGRES_PASSWORD:-buzz_dev}
-      POSTGRES_DB: buzz
-    volumes:
-      - buzz_postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U buzz -d buzz"]
-      interval: 5s
-      timeout: 5s
-      retries: 12
-      start_period: 10s
-    restart: unless-stopped
-
-  buzz-redis:
-    image: redis:7-alpine
-    profiles: ["buzz"]
-    command: ["redis-server", "--appendonly", "yes"]
-    volumes:
-      - buzz_redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 12
-      start_period: 5s
-    restart: unless-stopped
-
-  buzz-migrate:
-    image: ghcr.io/block/buzz:latest
-    profiles: ["buzz"]
-    entrypoint: ["/usr/local/bin/buzz-admin"]
-    command: ["migrate"]
-    environment:
-      DATABASE_URL: postgres://buzz:${BUZZ_POSTGRES_PASSWORD:-buzz_dev}@buzz-postgres:5432/buzz
-      # Needed for `docker compose run buzz-migrate add-member/remove-member`
-      # (buzz-admin signs the membership roster with the relay's own key, and
-      # needs RELAY_URL to resolve which community/workspace to operate on —
-      # the internal docker hostname, not the host-published localhost:3010).
-      BUZZ_RELAY_PRIVATE_KEY: ${BUZZ_RELAY_PRIVATE_KEY:-}
-      # Must match the `buzz` service's own RELAY_URL exactly (community rows are
-      # keyed by that string at seed time) — not the docker-internal hostname.
-      # 127.0.0.1, not localhost: buzz-acp's native-agent runtime always dials
-      # 127.0.0.1 regardless of configured relay_url, and NIP-98 HTTP bridge auth
-      # for /query and /events doesn't alias localhost/127.0.0.1 the way NIP-42
-      # WS auth does — so under localhost every native agent's ordinary /query
-      # call 401s. TRADEOFF (confirmed live in both directions on 2026-08-03 —
-      # see git history / conversation for the back-and-forth): Buzz Desktop's
-      # onboarding/profile-save call is separately hardcoded to sign against
-      # localhost regardless of this setting, so under 127.0.0.1 that call 401s
-      # and blocks onboarding for new/unmigrated identities. Chose agents working
-      # over onboarding — onboarding only blocks new identities, broken agents
-      # block everything the app is actually used for. If onboarding becomes the
-      # priority again, the fix is flipping this whole block to localhost, not
-      # more config tinkering.
-      RELAY_URL: ${BUZZ_RELAY_URL:-ws://127.0.0.1:3010}
-    depends_on:
-      buzz-postgres:
-        condition: service_healthy
-    restart: "no"
-
-  buzz:
-    image: ghcr.io/block/buzz:latest
-    profiles: ["buzz"]
-    # No host port published here anymore — see buzz-relay-proxy below, which
-    # now owns host port 3010 for ALL host-side clients (browser, Buzz Desktop,
-    # and Buzz Desktop's spawned native agents alike), not just buzz-agent-bridge.
-    # Routing every host-side client through the Host-rewriting proxy sidesteps
-    # the localhost/127.0.0.1 mismatch entirely instead of trying to make both
-    # resolve to the same registered community (communities.host is unique —
-    # only one literal string can ever be registered). See buzz-migrate's
-    # RELAY_URL comment for the localhost/127.0.0.1 tradeoff.
-    environment:
-      DATABASE_URL: postgres://buzz:${BUZZ_POSTGRES_PASSWORD:-buzz_dev}@buzz-postgres:5432/buzz
-      REDIS_URL: redis://buzz-redis:6379
-      BUZZ_BIND_ADDR: 0.0.0.0:3000
-      # See buzz-migrate's RELAY_URL comment for the localhost/127.0.0.1 tradeoff.
-      RELAY_URL: ${BUZZ_RELAY_URL:-ws://127.0.0.1:3010}
-      # Shares the stack-wide MinIO instance (see minio-init) rather than a
-      # dedicated buzz-minio — one object store instead of two. Credentials
-      # reuse DOCS_S3_* since they're the same server's root user.
-      BUZZ_S3_ENDPOINT: http://minio:9000
-      BUZZ_S3_ACCESS_KEY: ${DOCS_S3_ACCESS_KEY:-gcor_docs}
-      BUZZ_S3_SECRET_KEY: ${DOCS_S3_SECRET_KEY:-gcor_docs_secret}
-      BUZZ_S3_BUCKET: ${BUZZ_S3_BUCKET:-buzz-media}
-      BUZZ_GIT_REPO_PATH: /data/git
-      # Stable signing key for the relay's own identity (kind:13534 membership
-      # rosters, etc.). Documented in .env.example but was never actually wired
-      # through here — without it the relay signs with a fresh ephemeral keypair
-      # every restart, which breaks buzz-admin add-member/remove-member.
-      BUZZ_RELAY_PRIVATE_KEY: ${BUZZ_RELAY_PRIVATE_KEY:-}
-    volumes:
-      - buzz_git_data:/data/git
-    depends_on:
-      buzz-redis:
-        condition: service_healthy
-      minio-init:
-        condition: service_completed_successfully
-      buzz-migrate:
-        condition: service_completed_successfully
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/_readiness"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    restart: unless-stopped
-
-  # Rewrites the Host header to whatever the buzz service's single community row
-  # is keyed to (see buzz-relay-proxy/nginx.conf) so EVERY client — server-side
-  # (buzz-agent-bridge, which shares this container's network namespace — see
-  # its network_mode) and host-side (browser, Buzz Desktop, and Buzz Desktop's
-  # spawned native agents, via the published port below) — resolves to the
-  # same community, regardless of whether they dial in as "localhost" or
-  # "127.0.0.1". Canonical host is currently 127.0.0.1:3010 — see the
-  # localhost/127.0.0.1 tradeoff comment on buzz-migrate's RELAY_URL; neither
-  # choice satisfies every Buzz Desktop module, this just picks the one that
-  # keeps native agents working.
-  buzz-relay-proxy:
-    image: nginx:alpine
-    profiles: ["buzz"]
-    ports:
-      # Host 3010 -> container's plain listener (3010), matching RELAY_URL's
-      # ws:// scheme. Tried routing this through the container's TLS listener
-      # (3443) instead, to test whether Buzz Desktop's native agents need
-      # wss:// like Block's own hosted relay — reverted because the server's
-      # self-identity (RELAY_URL) is shared by ALL clients including
-      # buzz-agent-bridge, which can only ever reach the plain-only internal
-      # listener; there's no way to give host-side clients wss:// without
-      # breaking buzz-agent-bridge's NIP-42 auth (its signed relay tag must
-      # match the server's self-identity exactly, not just be reachable).
-      # The TLS listener (3443) stays defined in nginx.conf and the cert
-      # volume stays mounted, but nothing publishes 3443 to the host right now.
-      - "3010:3010"
-    volumes:
-      - ./buzz-relay-proxy/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./buzz-relay-proxy/certs:/etc/nginx/certs:ro
-    depends_on:
-      buzz:
-        condition: service_healthy
-    restart: unless-stopped
-
-  # Bridges a Buzz channel to the GCOR knowledge base: joins as its own agent
-  # identity, watches the channels listed in BUZZ_ACP_CHANNELS, and on a mention
-  # answers via the proxy's authenticated /v1/buzz/chat/completions route (full
-  # GCOR retrieval — Qdrant + Neo4j), posting the reply back into the channel.
-  # The agent_command is our own reply_adapter.py, not an LLM tool-calling loop:
-  # it deterministically calls the proxy and always posts the answer via
-  # `buzz messages send` — there's no LLM-driven decision to run anything else,
-  # so the model can't take any action beyond answering the question that
-  # reached it. See buzz-bridge/reply_adapter.py for why (buzz-agent + a shell
-  # tool answered questions but often never chose to call the "post" tool).
-  buzz-agent-bridge:
-    build:
-      context: ./buzz-bridge
-    profiles: ["buzz"]
-    # buzz-acp signs its NIP-42 auth event with a "relay" tag equal to whatever
-    # --relay-url it was given, and the server requires that to match its own
-    # configured self-identity (see RELAY_URL comment on buzz-migrate) — not
-    # just be *reachable*. Shares buzz-relay-proxy's network namespace so
-    # "localhost"/"127.0.0.1" both trivially resolve to buzz-relay-proxy's own
-    # loopback from this container's point of view — either identity string
-    # would route correctly here; it's the *server's* canonical identity
-    # (RELAY_URL) that decides which one has to be used.
-    network_mode: "service:buzz-relay-proxy"
-    environment:
-      # Required at runtime — validated by entrypoint.sh (not here: `${VAR:?}` would
-      # break `docker compose config`/`up` for the *default* profile too, since
-      # compose interpolates every service's env block regardless of --profile).
-      BUZZ_RELAY_URL: ws://127.0.0.1:3010
-      BUZZ_PRIVATE_KEY: ${BUZZ_AGENT_PRIVATE_KEY:-}
-      # --channels is no longer set here — channel_supervisor.sh (the
-      # container's entrypoint) computes it from live channel membership and
-      # relaunches buzz-acp itself whenever that set changes.
-      BUZZ_ACP_SUBSCRIBE: mentions
-      BUZZ_ACP_RESPOND_TO: ${BUZZ_ACP_RESPOND_TO:-anyone}
-      # reply_adapter.py — deterministic agent (see its file header): always
-      # calls the proxy and always posts the answer via `buzz messages send`,
-      # no LLM-driven decision to (not) publish. Replaced buzz-agent + a shell
-      # MCP tool after testing showed the model would answer the question but
-      # frequently never choose to call the "post" tool.
-      BUZZ_ACP_AGENT_COMMAND: /usr/local/bin/reply_adapter.py
-      BUZZ_ACP_AGENT_ARGS: ""
-      # idle_timeout must be < max_turn_duration (buzz-acp validates this at startup);
-      # both tightened well below the 900s/7200s defaults since a single call to
-      # the proxy should finish in seconds, not the default hour-plus.
-      BUZZ_ACP_IDLE_TIMEOUT: 60
-      BUZZ_ACP_MAX_TURN_DURATION: 120
-      # Read directly by reply_adapter.py (not by buzz-agent anymore).
-      OPENAI_COMPAT_BASE_URL: http://proxy:5001/v1/buzz
-      OPENAI_COMPAT_API_KEY: ${BUZZ_BRIDGE_API_KEY:-}
-    depends_on:
-      buzz:
-        condition: service_healthy
-      buzz-relay-proxy:
-        condition: service_started
-      proxy:
-        condition: service_healthy
-    restart: unless-stopped
-
   # ── Monitoring ────────────────────────────────────────────────────────────────
 
   prometheus:
@@ -639,6 +418,9 @@ services:
     restart: unless-stopped
 
 volumes:
+  falkordb_data:
+  # Legacy volumes are deliberately retained for rollback/data export. No active
+  # service mounts them after the Graphiti/FalkorDB migration.
   neo4j_data:
   qdrant_data:
   openclaw_config:

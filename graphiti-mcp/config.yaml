@@ -1,0 +1,50 @@
+server:
+  transport: http
+  host: 0.0.0.0
+  port: 8000
+
+llm:
+  provider: openai
+  model: ${MODEL_NAME:qwen2.5:7b}
+  structured_output_mode: json_object
+  max_tokens: 4096
+  providers:
+    openai:
+      api_key: ${OPENAI_API_KEY:ollama}
+      api_url: ${OPENAI_API_URL:http://ollama:11434/v1}
+
+embedder:
+  provider: openai
+  model: ${EMBEDDER_MODEL:nomic-embed-text}
+  dimensions: ${EMBEDDING_DIM:768}
+  providers:
+    openai:
+      api_key: ${OPENAI_API_KEY:ollama}
+      api_url: ${OPENAI_API_URL:http://ollama:11434/v1}
+
+database:
+  provider: falkordb
+  providers:
+    falkordb:
+      uri: ${FALKORDB_URI:redis://falkordb:6379}
+      password: ${FALKORDB_PASSWORD:}
+      database: ${FALKORDB_DATABASE:eedgeai}
+
+graphiti:
+  group_id: ${GRAPHITI_GROUP_ID:documents}
+  user_id: eedgeai
+  entity_types:
+    - name: Document
+      description: A source document, report, note, or other information artifact
+    - name: Person
+      description: A person referenced in the source material
+    - name: Organization
+      description: A company, institution, team, or other organization
+    - name: Requirement
+      description: A need, constraint, or required behavior
+    - name: Procedure
+      description: A process or ordered set of instructions
+    - name: Event
+      description: A time-bound occurrence
+    - name: Topic
+      description: A subject or concept discussed in the source material

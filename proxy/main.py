@@ -175,10 +175,14 @@ EMBED_MAX_RETRIES = int(os.getenv("EMBED_MAX_RETRIES",  "6"))    # 429/5xx retry
 LLM_MAX_RETRIES   = int(os.getenv("LLM_MAX_RETRIES",    "3"))    # 429/529/5xx chat retry attempts
 LLM_RETRY_BASE    = float(os.getenv("LLM_RETRY_BASE",  "1.0"))   # base delay for LLM retries
 
-# ── Qdrant (semantic perception layer) ────────────────────────────────────────
-QDRANT_URL        = os.getenv("QDRANT_URL",        "http://qdrant:6333")
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "documents")
-QDRANT_TOP_K      = int(os.getenv("QDRANT_TOP_K",  "8"))
+# ── Graphiti temporal graph (FalkorDB backend) ───────────────────────────────
+GRAPHITI_URL      = os.getenv("GRAPHITI_URL", "http://graphiti:8000").rstrip("/")
+GRAPHITI_GROUP_ID = os.getenv("GRAPHITI_GROUP_ID", "documents")
+GRAPHITI_TOP_K    = int(os.getenv("GRAPHITI_TOP_K", "8"))
+
+# Compatibility aliases retained for the existing Knowledge UI route names.
+QDRANT_COLLECTION = GRAPHITI_GROUP_ID
+QDRANT_TOP_K      = GRAPHITI_TOP_K
 
 # Cached embedding dimension — probed once at first use
 _embed_dim_cache: int | None = None
@@ -200,6 +204,68 @@ NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "test1234")
 NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
 
 ENABLE_RAG = os.getenv("ENABLE_RAG", "true").lower() in ("true", "1", "yes")
+
+
+async def graphiti_search(query: str, group_id: str | None = None) -> tuple[list, list]:
+    """Search Graphiti and adapt temporal facts to the proxy's context contract."""
+    group = group_id or GRAPHITI_GROUP_ID
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            f"{GRAPHITI_URL}/search",
+            json={"group_ids": [group], "query": query, "max_facts": GRAPHITI_TOP_K},
+        )
+        response.raise_for_status()
+    facts = response.json().get("facts", [])
+    hits = []
+    records = []
+    for rank, fact in enumerate(facts):
+        payload = {
+            "text": fact.get("fact", ""),
+            "graphiti_edge_uuid": fact.get("uuid", ""),
+            "document_id": (fact.get("episodes") or [""])[0],
+            "document_title": fact.get("name", "Graphiti fact"),
+            "confidence": 1.0,
+            "valid_from": fact.get("valid_at") or fact.get("created_at"),
+            "valid_to": fact.get("invalid_at") or fact.get("expired_at"),
+            "access_level": "public",
+        }
+        hits.append({"id": fact.get("uuid"), "score": 1.0 - rank / max(len(facts), 1), "payload": payload})
+        records.append({
+            "node": payload,
+            "labels": ["TemporalFact"],
+            "document": {"title": fact.get("name", "Graphiti fact")},
+            "related": [],
+        })
+    return hits, records
+
+
+async def graphiti_ingest(
+    group_id: str, doc_id: str, title: str, source: str, chunks: list[str],
+    agent_id: str, access_level: str, valid_to: str | None = None,
+) -> int:
+    """Queue document chunks as Graphiti episodes in a group namespace."""
+    now = datetime.now(timezone.utc).isoformat()
+    messages = []
+    for position, chunk in enumerate(chunks):
+        metadata = (
+            f"Document: {title}\nSource: {source}\nDocument ID: {doc_id}\n"
+            f"Chunk: {position + 1}/{len(chunks)}\nAgent: {agent_id or 'shared'}\n"
+            f"Access: {access_level}\nValid until: {valid_to or 'open'}\n\n"
+        )
+        messages.append({
+            "name": f"{title} — chunk {position + 1}",
+            "content": metadata + chunk,
+            "role_type": "system",
+            "role": "document",
+            "timestamp": now,
+            "source_description": source,
+        })
+    async with httpx.AsyncClient(timeout=300) as client:
+        response = await client.post(
+            f"{GRAPHITI_URL}/messages", json={"group_id": group_id, "messages": messages}
+        )
+        response.raise_for_status()
+    return len(messages)
 
 # ── Cognitive infrastructure knobs ────────────────────────────────────────────
 # Minimum confidence (0.0–1.0) — hits below this are discarded
@@ -1053,14 +1119,14 @@ def build_gcor_context(intent: str, qdrant_hits: list, graph_records: list, prov
     now = _now_iso()
     lines = [
         f"## Retrieved Context  [intent: {intent} | "
-        f"{len(qdrant_hits)} semantic candidates → {len(records)} graph records"
+        f"{len(qdrant_hits)} Graphiti facts → {len(records)} graph records"
         + (f" | {confidence_note}{agent_note}".rstrip() if (confidence_note or agent_note) else "")
         + "]",
         "",
         f"Current time: {now[:19]}Z. "
-        "Neo4j is the primary source of truth. Qdrant identified the entry points. "
-        "All results have been temporally filtered — only currently valid knowledge "
-        "is shown. Prefer more recent sources when information conflicts.",
+        "Graphiti on FalkorDB is the source of truth. Results combine semantic, keyword, "
+        "graph, and temporal retrieval. Prefer currently valid and more recent facts "
+        "when information conflicts.",
     ]
     if provenance:
         lines += ["", f"**Retrieval Provenance:** {provenance}"]
@@ -1923,31 +1989,26 @@ async def _run_chat_completion(body: dict, rag_collection: str | None):
             rag_intent = intent
             logger.info("GCOR intent: %s", intent)
 
-            # ── Step 2a: Semantic (Qdrant → element IDs) ────────────────────
-            vector      = await embed_text(query)
-            raw_hits    = await qdrant_search(vector, rag_collection) if vector else []
+            # ── Step 2: Graphiti hybrid temporal retrieval ──────────────────
+            raw_hits, graph_records = await graphiti_search(query, rag_collection)
             qdrant_hits = _filter_hits(raw_hits)
-            element_ids = [
-                h["payload"]["neo4j_element_id"]
-                for h in qdrant_hits
-                if h.get("payload", {}).get("neo4j_element_id")
-            ]
             METRIC_QDRANT_HITS.observe(len(qdrant_hits))
             logger.info(
-                "Qdrant[%s]: %d raw → %d after cognitive filters, %d with neo4j_element_id",
-                rag_collection or "default", len(raw_hits), len(qdrant_hits), len(element_ids),
+                "Graphiti[%s]: %d facts → %d after policy filters",
+                rag_collection or GRAPHITI_GROUP_ID, len(raw_hits), len(qdrant_hits),
             )
-
-            # ── Step 2b: Structural (Neo4j graph expansion) ─────────────────
-            graph_records = await neo4j_expand(element_ids, intent, query)
             METRIC_NEO4J_RECORDS.observe(len(graph_records))
-            logger.info("Neo4j: %d graph records expanded", len(graph_records))
+            logger.info("Graphiti: %d temporal graph records retrieved", len(graph_records))
 
             # ── Step 2c: Belief conflict resolution ─────────────────────────
             graph_records = resolve_belief_conflicts(graph_records)
 
-            # ── Step 2d: Provenance chain ────────────────────────────────────
-            provenance = await build_provenance_chain(element_ids)
+            # Graphiti fact results retain their source episode UUIDs.
+            provenance = " | ".join(
+                str((hit.get("payload") or {}).get("document_id", ""))
+                for hit in qdrant_hits[:3]
+                if (hit.get("payload") or {}).get("document_id")
+            )
             if provenance:
                 logger.info("Provenance chain: %s", provenance[:120])
 
@@ -1956,9 +2017,9 @@ async def _run_chat_completion(body: dict, rag_collection: str | None):
 
             # Determine fallback mode for metrics
             if graph_records:
-                rag_fallback = "full_gcor"
+                rag_fallback = "graphiti"
             elif qdrant_hits:
-                rag_fallback = "qdrant_text"
+                rag_fallback = "graphiti_fact"
             else:
                 rag_fallback = "llm_only"
 
@@ -2116,8 +2177,40 @@ async def api_buckets():
 
 @app.get("/api/collections")
 async def api_collections():
-    """List all Qdrant collections with Neo4j document stats."""
-    # Fetch Qdrant collections
+    """List configured Graphiti group namespaces and recent episodes."""
+    names = list(dict.fromkeys([GRAPHITI_GROUP_ID, *RAG_EXTRA_COLLECTIONS]))
+    collections = []
+    async with httpx.AsyncClient(timeout=30) as client:
+        for name in names:
+            recent = []
+            count = 0
+            try:
+                response = await client.get(f"{GRAPHITI_URL}/episodes/{name}", params={"last_n": 200})
+                response.raise_for_status()
+                episodes = response.json()
+                count = len(episodes)
+                recent = [
+                    {
+                        "doc_id": episode.get("uuid", ""),
+                        "title": episode.get("name") or "Graphiti episode",
+                        "created_at": episode.get("created_at") or episode.get("valid_at"),
+                        "access_level": "public",
+                    }
+                    for episode in episodes[:5]
+                ]
+            except Exception as exc:
+                logger.warning("Graphiti group metadata failed for '%s': %s", name, exc)
+            collections.append({
+                "name": name,
+                "points_count": count,
+                "doc_count": count,
+                "recent_docs": recent,
+                "embedding_model": os.getenv("GRAPHITI_EMBEDDING_MODEL", OLLAMA_EMBEDDING_MODEL),
+            })
+    return {"collections": collections, "embedding_model": os.getenv("GRAPHITI_EMBEDDING_MODEL", OLLAMA_EMBEDDING_MODEL)}
+
+    # Legacy Qdrant/Neo4j implementation retained below temporarily for API
+    # history; it is unreachable after the Graphiti return above.
     collections = []
     try:
         async with httpx.AsyncClient(timeout=10) as c:
@@ -2173,10 +2266,22 @@ async def api_collections():
 
 @app.get("/api/collections/{name}/docs")
 async def api_collection_docs(name: str):
-    """List all Document nodes in Neo4j for a given collection."""
+    """List recent Graphiti episodes for a group namespace."""
     try:
-        doc_ids = await _qdrant_collection_doc_ids(name, limit=200)
-        docs = await _neo4j_fetch_documents(doc_ids)
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(f"{GRAPHITI_URL}/episodes/{name}", params={"last_n": 200})
+            response.raise_for_status()
+            episodes = response.json()
+        docs = [
+            {
+                "doc_id": episode.get("uuid", ""),
+                "title": episode.get("name") or "Graphiti episode",
+                "created_at": episode.get("created_at") or episode.get("valid_at"),
+                "access_level": "public",
+                "chunk_count": 1,
+            }
+            for episode in episodes
+        ]
         return {"collection": name, "docs": docs}
     except HTTPException:
         raise
@@ -2189,7 +2294,15 @@ _DOC_ARCHIVE_COLLECTION = "_doc_archive"
 
 @app.delete("/api/collections/{name}/docs/{doc_id}")
 async def api_archive_document(name: str, doc_id: str):
-    """Archive a single document: move its Qdrant points to _doc_archive, mark Neo4j nodes."""
+    """Delete one Graphiti episode. Source files remain preserved in MinIO."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.delete(f"{GRAPHITI_URL}/episode/{doc_id}")
+        if response.status_code == 404:
+            raise HTTPException(status_code=404, detail=f"Episode '{doc_id}' not found")
+        response.raise_for_status()
+    return {"status": "deleted", "doc_id": doc_id, "collection": name}
+
+    # Legacy archive implementation retained below for API history.
     now = _now_iso()
     points: list = []
 
@@ -2424,11 +2537,15 @@ async def api_restore_doc_archive(doc_id: str, request: Request):
 
 @app.post("/api/collections")
 async def api_create_collection(request: Request):
-    """Create a new empty Qdrant collection."""
+    """Validate a new Graphiti group name; groups materialize on first ingest."""
     body = await request.json()
     name = (body.get("name") or "").strip()
     if not name or "/" in name or ".." in name:
         raise HTTPException(status_code=400, detail="Invalid collection name")
+    METRIC_COLLECTION_OPS.labels(operation="create").inc()
+    return {"status": "ok", "name": name, "materializes_on_first_ingest": True}
+
+    # Legacy implementation retained below for API history.
     vec_size = int(body.get("vector_size", 0)) or await _get_embed_dim()
     distance = body.get("distance", "Cosine")
     async with httpx.AsyncClient(timeout=30) as c:
@@ -2446,11 +2563,17 @@ async def api_create_collection(request: Request):
 
 @app.patch("/api/collections/{name}")
 async def api_rename_collection(name: str, request: Request):
-    """Rename a Qdrant collection: create new, scroll-copy all points, delete old."""
+    """Graphiti group renames require re-ingestion to preserve provenance."""
     body = await request.json()
     new_name = (body.get("name") or "").strip()
     if not new_name or "/" in new_name or ".." in new_name:
         raise HTTPException(status_code=400, detail="Invalid collection name")
+    raise HTTPException(
+        status_code=409,
+        detail="Graphiti group IDs are immutable; ingest into the new group, verify it, then delete the old group.",
+    )
+
+    # Legacy implementation retained below for API history.
     if new_name == name:
         return {"status": "ok", "name": new_name, "points_copied": 0}
 
@@ -2506,7 +2629,16 @@ async def api_rename_collection(name: str, request: Request):
 
 @app.delete("/api/collections/{name}")
 async def api_archive_collection(name: str):
-    """Archive a collection: copy to _archived_* in Qdrant, mark Neo4j docs, record in graph."""
+    """Delete a Graphiti group after its source objects have been retained in MinIO."""
+    if name == GRAPHITI_GROUP_ID:
+        raise HTTPException(status_code=409, detail="The default Graphiti group cannot be deleted")
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.delete(f"{GRAPHITI_URL}/group/{name}")
+        response.raise_for_status()
+    METRIC_COLLECTION_OPS.labels(operation="delete").inc()
+    return {"status": "deleted", "name": name}
+
+    # Legacy implementation retained below for API history.
     ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     archive_qname = f"_archived_{name}_{ts_ms}"
     now = _now_iso()
@@ -2728,52 +2860,9 @@ async def api_search(
     q: str = Query(...),
     top_k: int = Query(8),
 ):
-    """Semantic search against a Qdrant collection.
-
-    Validates that the collection's vector dimension matches the active
-    embedding model before searching to prevent garbage scores.
-    """
-    vector = await embed_text(q)
-    if not vector:
-        raise HTTPException(status_code=503, detail="Embedding unavailable — check OPENAI_API_KEY")
+    """Hybrid temporal search against a Graphiti group namespace."""
     try:
-        async with httpx.AsyncClient(timeout=30) as c:
-            # Dimension guard — reject if collection dim != query dim
-            info = await c.get(f"{QDRANT_URL}/collections/{collection}")
-            if info.status_code == 404:
-                return {"results": [], "error": f"Collection '{collection}' not found"}
-            col_dim = (info.json().get("result", {})
-                       .get("config", {}).get("params", {})
-                       .get("vectors", {}).get("size"))
-            if col_dim and col_dim != len(vector):
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Dimension mismatch: collection '{collection}' has {col_dim}-dim "
-                           f"vectors but current embedding model produces {len(vector)}-dim. "
-                           f"Re-embed the collection or switch EMBEDDING_BACKEND.",
-                )
-            now = _now_iso()
-            temporal_filter = {
-                "must": [
-                    {"should": [
-                        {"is_empty": {"key": "valid_to"}},
-                        {"key": "valid_to", "range": {"gte": now}},
-                    ]},
-                    {"should": [
-                        {"is_empty": {"key": "valid_from"}},
-                        {"key": "valid_from", "range": {"lte": now}},
-                    ]},
-                ],
-            }
-            resp = await c.post(
-                f"{QDRANT_URL}/collections/{collection}/points/search",
-                json={"vector": vector, "limit": top_k, "with_payload": True,
-                      "filter": temporal_filter},
-            )
-            if resp.status_code == 404:
-                return {"results": [], "error": f"Collection '{collection}' not found"}
-            resp.raise_for_status()
-            hits = resp.json().get("result", [])
+        hits, _ = await graphiti_search(q, collection)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
@@ -2781,11 +2870,11 @@ async def api_search(
         {
             "score":            h.get("score", 0),
             "text":             h.get("payload", {}).get("text", ""),
-            "neo4j_element_id": h.get("payload", {}).get("neo4j_element_id", ""),
+            "graphiti_edge_uuid": h.get("payload", {}).get("graphiti_edge_uuid", ""),
             "doc_title":        h.get("payload", {}).get("document_title", ""),
             "position":         h.get("payload", {}).get("position"),
         }
-        for h in hits
+        for h in hits[:top_k]
     ]
     return {"collection": collection, "query": q, "results": results}
 
@@ -2876,39 +2965,23 @@ async def _ingest_bytes(
     )
 
     try:
-        _, chunk_eids = await _neo4j_ingest(
-            doc_id, doc_title, filename, chunks, agent_id, access_level, image_props,
+        upserted = await graphiti_ingest(
+            target_collection, doc_id, doc_title, filename, chunks, agent_id, access_level,
             valid_to=valid_to,
         )
     except Exception as exc:
-        METRIC_INGEST_TOTAL.labels(status="neo4j_error").inc()
-        raise HTTPException(status_code=502, detail=f"Neo4j: {exc}")
+        METRIC_INGEST_TOTAL.labels(status="graphiti_error").inc()
+        raise HTTPException(status_code=502, detail=f"Graphiti: {exc}")
 
-    # Persist DocTable nodes for DocInt results
-    if doc_id in _docint_tables_pending:
-        try:
-            await _neo4j_ingest_tables(doc_id, _docint_tables_pending.pop(doc_id))
-        except Exception as e:
-            logger.warning("DocInt table Neo4j write failed: %s", e)
-
-    try:
-        upserted = await _qdrant_ingest(
-            target_collection, chunks, chunk_eids, doc_id, doc_title, agent_id, access_level,
-            valid_to=valid_to,
-        )
-    except Exception as exc:
-        METRIC_INGEST_TOTAL.labels(status="qdrant_error").inc()
-        raise HTTPException(status_code=502, detail=f"Qdrant: {exc}")
+    # Graphiti extracts entities, relationships, provenance, and temporal facts
+    # asynchronously from each episode; no separate NER/graph backfill is needed.
+    _docint_tables_pending.pop(doc_id, None)
 
     METRIC_INGEST_TOTAL.labels(status="success").inc()
     METRIC_INGEST_CHUNKS.observe(len(chunks))
 
-    # NER entity extraction runs in the background so ingest response is immediate
-    if background_tasks is not None:
-        background_tasks.add_task(_neo4j_create_mentions, chunk_eids, chunks)
-
     result_json = {"status": "ok", "document_id": doc_id, "title": doc_title,
-                   "filename": filename, "chunks": len(chunks), "qdrant_points": upserted,
+                   "filename": filename, "chunks": len(chunks), "graphiti_episodes": upserted,
                    "collection": target_collection}
     if valid_to:
         result_json["valid_to"] = valid_to
@@ -4141,34 +4214,22 @@ async def ingest_document(
     )
 
     try:
-        doc_eid, chunk_eids = await _neo4j_ingest(
-            doc_id, doc_title, filename, chunks, agent_id, access_level, image_props,
+        upserted = await graphiti_ingest(
+            GRAPHITI_GROUP_ID, doc_id, doc_title, filename, chunks, agent_id, access_level,
             valid_to=valid_to,
         )
     except Exception as exc:
-        logger.error("Neo4j ingest failed: %s", exc)
-        raise HTTPException(status_code=502, detail=f"Neo4j ingest failed: {exc}")
-
-    try:
-        upserted = await _qdrant_ingest(
-            QDRANT_COLLECTION, chunks, chunk_eids, doc_id, doc_title, agent_id, access_level,
-            valid_to=valid_to,
-        )
-    except Exception as exc:
-        logger.error("Qdrant ingest failed: %s", exc)
-        raise HTTPException(status_code=502, detail=f"Qdrant ingest failed: {exc}")
-
-    background_tasks.add_task(_neo4j_create_mentions, chunk_eids, chunks)
+        logger.error("Graphiti ingest failed: %s", exc)
+        raise HTTPException(status_code=502, detail=f"Graphiti ingest failed: {exc}")
 
     result = {
         "status":        "ok",
         "document_id":   doc_id,
-        "document_eid":  doc_eid,
         "title":         doc_title,
         "filename":      filename,
         "chunks":        len(chunks),
-        "qdrant_points": upserted,
-        "collection":    QDRANT_COLLECTION,
+        "graphiti_episodes": upserted,
+        "collection":    GRAPHITI_GROUP_ID,
     }
     if valid_to:
         result["valid_to"] = valid_to

@@ -329,9 +329,9 @@
       <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
       OpenClaw
     </a>
-    <a class="nav-item" href="http://localhost:3010" target="_blank">
+    <a class="nav-item" href="http://localhost:3001" target="_blank">
       <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8h2a2 2 0 012 2v6a2 2 0 01-2 2h-2v4l-4-4H9a1.994 1.994 0 01-1.414-.586m0 0L11 14h4a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h1v4l3.586-3.586z"/></svg>
-      Buzz
+      FalkorDB
     </a>
     <a class="nav-item" href="http://localhost:9001" target="_blank">
       <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"/></svg>
@@ -502,13 +502,11 @@
     </div>
     <div class="modal-body">
       <div class="warning-box">
-        <strong>This collection will be archived, not permanently deleted.</strong><br>
-        All Qdrant vector embeddings will be preserved in a hidden archive collection.
-        Neo4j Document and Chunk nodes will be marked as archived.
-        You can fully restore everything from the <strong>Archives</strong> panel at any time.
+        <strong>This Graphiti group will be permanently deleted.</strong><br>
+        Its episodes, extracted entities, and facts will be removed from FalkorDB.
       </div>
       <button id="delete-confirm-btn" class="btn-danger" onclick="archiveCollection()">
-        Archive &amp; Delete
+        Delete Group
       </button>
       <button class="btn-cancel" onclick="closeModal('delete-modal')">Cancel</button>
       <div id="delete-ok"  class="alert alert-ok"  style="margin-top:10px"></div>
@@ -578,7 +576,7 @@
         <input type="text" id="new-col-name" class="form-input" placeholder="my-collection"
                onkeydown="if(event.key==='Enter')createCollection()">
         <p style="font-size:.75rem;color:var(--text-muted);margin-top:6px">
-          Used as the Qdrant collection identifier. Letters, numbers, hyphens and underscores.
+          Used as the Graphiti group identifier. Letters, numbers, hyphens and underscores.
         </p>
       </div>
       <button id="new-col-submit" class="submit-btn" onclick="createCollection()">Create Collection</button>
@@ -675,9 +673,9 @@
       </div>
       <div class="card-badges">
         <span class="badge-healthy">HEALTHY</span>
-        <span class="badge-model">${esc(col.embedding_model || 'text-embedding-3-small')}</span>
+        <span class="badge-model">${esc(col.embedding_model || 'nomic-embed-text')}</span>
       </div>
-      <p class="card-desc">GCOR knowledge collection — Neo4j graph backbone + Qdrant vector index</p>
+      <p class="card-desc">Graphiti temporal knowledge group stored in FalkorDB</p>
       <div class="sources-label">
         <div class="dot"></div>
         ${col.doc_count} Document${col.doc_count !== 1 ? 's' : ''}
@@ -728,7 +726,7 @@
         <div class="result-item">
           <div class="result-score">Score: ${(r.score * 100).toFixed(1)}%&emsp;${esc(r.doc_title || '')}</div>
           <div class="result-text">${esc(r.text)}</div>
-          <div class="result-meta">Neo4j: ${esc(r.neo4j_element_id || '')} &nbsp;·&nbsp; pos ${r.position ?? '–'}</div>
+          <div class="result-meta">Graphiti fact: ${esc(r.uuid || r.source_uuid || '')}</div>
         </div>`).join('');
     } catch (e) { el.innerHTML = `<p style="color:#f87171;font-size:.85rem">${e.message}</p>`; }
   }
@@ -861,7 +859,7 @@
       if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
 
       const bucketNote = d.storage ? ` · bucket "${esc(d.storage.bucket)}"` : '';
-      ok.innerHTML = `✓ <strong>${esc(d.title)}</strong> ingested — ${d.chunks} chunks · ${d.qdrant_points} vectors${bucketNote}`;
+      ok.innerHTML = `✓ <strong>${esc(d.title)}</strong> ingested — ${d.chunks} chunks · ${d.graphiti_episodes ?? d.chunks} Graphiti episodes${bucketNote}`;
       ok.style.display = 'block';
 
       // Render Document Intelligence summary if available
