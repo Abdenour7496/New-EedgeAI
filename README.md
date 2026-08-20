@@ -169,11 +169,12 @@ eedgeai/
 │   ├── Dockerfile                 ← extends openclaw base image (build context: project root)
 │   ├── entrypoint.sh              ← seeds config from /opt/openclaw-seed, starts relay, execs openclaw
 │   ├── hotfix-openclaw-runtime.js ← patches the bundled runtime bundle at build time
-│   ├── package.json               ← neo4j-driver, qdrant client, pdf-parse, mammoth
+│   ├── package.json               ← neo4j-driver, qdrant client, pdf-parse, mammoth, minio, pdfkit
 │   ├── package-lock.json          ← lockfile (committed for reproducible builds)
 │   ├── neo4j.js                   ← neo4j-cli  (shell tool for OpenClaw agent)
 │   ├── qdrant.js                  ← qdrant-cli (shell tool for OpenClaw agent)
 │   ├── ingest.js                  ← ingest-cli (document ingestion tool)
+│   ├── pdf.js                     ← pdf-cli (spec-compliant PDF generation, via pdfkit)
 │   └── image-extractor.js         ← image extraction helper
 ├── openclaw-config/
 │   └── openclaw.json              ← seed config: models, fallbacks, MCP servers, Telegram, auth profiles
@@ -425,6 +426,16 @@ ingest-cli /path/to/spec.docx --title "Technical Spec"
 ingest-cli /path/to/doc.txt --agent-id "my-agent" --access-level restricted
 echo "content here" | ingest-cli --stdin --title "Quick Note"
 ```
+
+**Generating a PDF to ingest (pdf-cli).** `ingest-cli`'s PDF extraction (`pdf-parse`, backed by `pdfjs-dist`) is strict about PDF spec compliance — a hand-assembled PDF (raw bytes written without a real PDF library) will fail extraction with an error like `Invalid number: (charCode 32)` rather than degrading gracefully. If the agent needs to produce a PDF (a session summary, a report) rather than ingest an existing one, use `pdf-cli` — it writes fully spec-compliant PDFs via `pdfkit`, so the output round-trips through `ingest-cli` cleanly:
+
+```bash
+pdf-cli notes.md --output notes.pdf --title "My Doc"
+echo "some text" | pdf-cli --stdin --output out.pdf --title "Quick Note"
+ingest-cli out.pdf --title "Quick Note"
+```
+
+Input is plain text or light Markdown (`# `/`## ` headings, `- `/`* ` bullets, blank-line paragraph breaks) — not full CommonMark.
 
 ### Via API
 

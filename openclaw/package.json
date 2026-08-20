@@ -22,7 +22,8 @@
     "minio": "^8.0.7",
     "neo4j-driver": "^5.27.0",
     "nifti-reader-js": "^0.6.6",
-    "pdf-parse": "^1.1.1",
-    "sharp": "^0.33.5"
+    "pdfkit": "^0.15.2",
+    "sharp": "^0.35.3",
+    "unpdf": "^1.8.0"
   }
 }

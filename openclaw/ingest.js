@@ -13,7 +13,7 @@
  * Supported formats
  * -----------------
  *   .txt  .md  .json  .csv   — plain text / UTF-8
- *   .pdf                     — pdf-parse (text layer only)
+ *   .pdf                     — unpdf (text layer only)
  *   .docx                    — mammoth
  *
  * Usage
@@ -129,11 +129,19 @@ async function extractText(fp, rawBuffer) {
 
   if (ext === '.pdf') {
     try {
-      const pdfParse = require('pdf-parse');
-      const data = await pdfParse(rawBuffer);
-      return data.text;
+      // unpdf, not pdf-parse: pdf-parse@1.1.4 vendors a hardcoded 2018-era
+      // pdfjs-dist (v1.10.100) that breaks on ANY PDF — not just malformed
+      // ones — once Node's own 'http' module has been loaded anywhere in the
+      // process (true here: neo4j-driver/minio/qdrant-client/image-extractor
+      // all pull it in transitively before this code ever runs), throwing
+      // "bad XRef entry" on perfectly valid input. unpdf wraps a current,
+      // actively-maintained pdfjs-dist build with no such issue.
+      const { extractText: extractPdfText, getDocumentProxy } = require('unpdf');
+      const pdf = await getDocumentProxy(new Uint8Array(rawBuffer));
+      const { text } = await extractPdfText(pdf, { mergePages: true });
+      return text;
     } catch (e) {
-      throw new Error(`PDF parse failed: ${e.message}. Ensure pdf-parse is installed.`);
+      throw new Error(`PDF parse failed: ${e.message}. Ensure unpdf is installed.`);
     }
   }
 

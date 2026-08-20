@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__Lokka-Microsoft__get-auth-status",
+      "mcp__Lokka-Microsoft__Lokka-Microsoft"
+    ]
+  }
+}
