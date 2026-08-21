@@ -1426,16 +1426,8 @@ async def call_openclaw(body: dict):
                 yield f"data: {json.dumps(normalized_payload)}\n\n".encode()
 
         async def stream():
-            async def copilot_fallback_stream():
-                logger.warning("OpenClaw upstream failed; falling back to github-copilot/gpt-4.1")
-                METRIC_LLM_REQUESTS.labels(backend="openclaw", status="fallback_githubcopilot").inc()
-                # Try github-copilot/gpt-4.1 via OpenAI-compatible endpoint
-                fallback_response = await call_copilot({**body, "model": COPILOT_CHAT_MODEL, "stream": True})
-                async for chunk in fallback_response.body_iterator:
-                    yield chunk
-
             async def ollama_fallback_stream():
-                logger.warning("OpenClaw upstream failed; falling back to Ollama model %s", OLLAMA_MODEL)
+                logger.warning("OpenClaw provider chain exhausted; falling back to Ollama model %s", OLLAMA_MODEL)
                 METRIC_LLM_REQUESTS.labels(backend="openclaw", status="fallback_ollama").inc()
                 fallback_response = await call_ollama({**body, "model": OLLAMA_MODEL, "stream": True})
                 async for chunk in fallback_response.body_iterator:
@@ -1449,16 +1441,9 @@ async def call_openclaw(body: dict):
                             err = await resp.aread()
                             logger.error("OpenClaw %s: %s", resp.status_code, err[:200])
                             if resp.status_code >= 500:
-                                # Try github-copilot/gpt-4.1 first, then Ollama if that fails
-                                try:
-                                    async for chunk in copilot_fallback_stream():
-                                        yield chunk
-                                    return
-                                except Exception as exc:
-                                    logger.error("Copilot fallback failed: %s", exc)
-                                    async for chunk in ollama_fallback_stream():
-                                        yield chunk
-                                    return
+                                async for chunk in ollama_fallback_stream():
+                                    yield chunk
+                                return
                             METRIC_LLM_REQUESTS.labels(backend="openclaw", status="error").inc()
                             yield f'data: {{"error": "OpenClaw {resp.status_code}"}}\n\n'.encode()
                             return
@@ -1467,13 +1452,8 @@ async def call_openclaw(body: dict):
                             yield chunk
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
                 logger.error("OpenClaw stream error: %s", exc)
-                try:
-                    async for chunk in copilot_fallback_stream():
-                        yield chunk
-                except Exception as exc:
-                    logger.error("Copilot fallback failed: %s", exc)
-                    async for chunk in ollama_fallback_stream():
-                        yield chunk
+                async for chunk in ollama_fallback_stream():
+                    yield chunk
             except Exception as exc:
                 logger.error("OpenClaw stream error: %s", exc)
                 METRIC_LLM_REQUESTS.labels(backend="openclaw", status="exception").inc()
@@ -1492,28 +1472,16 @@ async def call_openclaw(body: dict):
             error_text = exc.response.text[:500]
             logger.error("OpenClaw %s: %s", exc.response.status_code, error_text)
             if exc.response.status_code >= 500:
-                logger.warning("OpenClaw upstream failed; falling back to github-copilot/gpt-4.1")
-                METRIC_LLM_REQUESTS.labels(backend="openclaw", status="fallback_githubcopilot").inc()
-                try:
-                    return await call_copilot({**body, "model": COPILOT_CHAT_MODEL, "stream": False})
-                except Exception as exc:
-                    logger.error("Copilot fallback failed: %s", exc)
-                    logger.warning("Falling back to Ollama model %s", OLLAMA_MODEL)
-                    METRIC_LLM_REQUESTS.labels(backend="openclaw", status="fallback_ollama").inc()
-                    return await call_ollama({**body, "model": OLLAMA_MODEL, "stream": False})
+                logger.warning("OpenClaw provider chain exhausted; falling back to Ollama model %s", OLLAMA_MODEL)
+                METRIC_LLM_REQUESTS.labels(backend="openclaw", status="fallback_ollama").inc()
+                return await call_ollama({**body, "model": OLLAMA_MODEL, "stream": False})
             METRIC_LLM_REQUESTS.labels(backend="openclaw", status="error").inc()
             raise
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
             logger.error("OpenClaw transport error: %s", exc)
-            logger.warning("OpenClaw timed out/unreachable; falling back to github-copilot/gpt-4.1")
-            METRIC_LLM_REQUESTS.labels(backend="openclaw", status="fallback_githubcopilot").inc()
-            try:
-                return await call_copilot({**body, "model": COPILOT_CHAT_MODEL, "stream": False})
-            except Exception as exc:
-                logger.error("Copilot fallback failed: %s", exc)
-                logger.warning("Falling back to Ollama model %s", OLLAMA_MODEL)
-                METRIC_LLM_REQUESTS.labels(backend="openclaw", status="fallback_ollama").inc()
-                return await call_ollama({**body, "model": OLLAMA_MODEL, "stream": False})
+            logger.warning("OpenClaw unreachable; falling back to Ollama model %s", OLLAMA_MODEL)
+            METRIC_LLM_REQUESTS.labels(backend="openclaw", status="fallback_ollama").inc()
+            return await call_ollama({**body, "model": OLLAMA_MODEL, "stream": False})
         except Exception:
             METRIC_LLM_REQUESTS.labels(backend="openclaw", status="error").inc()
             raise

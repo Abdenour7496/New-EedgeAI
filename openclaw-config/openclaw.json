@@ -47,18 +47,24 @@
   "agents": {
     "defaults": {
       "model": {
-        "primary": "claude-cli/claude-sonnet-4-6",
+        "primary": "openai/gpt-5.6-sol",
         "fallbacks": [
-          "github-copilot/gpt-5.4-mini",
+          "anthropic/claude-sonnet-4-6",
           "ollama/llama3.2:latest"
         ]
       },
       "models": {
-        "claude-cli/claude-sonnet-4-6": {
-          "alias": "claude"
+        "openai/gpt-5.6-sol": {
+          "alias": "codex",
+          "agentRuntime": {
+            "id": "codex"
+          }
         },
-        "github-copilot/gpt-5.4-mini": {
-          "alias": "copilot"
+        "anthropic/claude-sonnet-4-6": {
+          "alias": "claude",
+          "agentRuntime": {
+            "id": "claude-cli"
+          }
         },
         "ollama/llama3.2:latest": {
           "alias": "local"
@@ -84,16 +90,9 @@
     "servers": {
       "graphiti-memory": {
         "type": "http",
-        "url": "http://graphiti-mcp:8000/mcp/"
+        "url": "http://graphiti-mcp-proxy:8000/mcp"
       }
     }
   },
-  "auth": {
-    "profiles": {
-      "github-copilot:github": {
-        "provider": "github-copilot",
-        "mode": "token"
-      }
-    }
-  }
+  "auth": { "profiles": {} }
 }

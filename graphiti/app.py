@@ -15,7 +15,7 @@ from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 from graphiti_core.edges import EntityEdge
 from graphiti_core.llm_client.config import LLMConfig
 from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
-from graphiti_core.nodes import EpisodeType, EpisodicNode
+from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
 
 
 class Message(BaseModel):
@@ -203,4 +203,8 @@ async def delete_group(group_id: str):
         await edge.delete(app.state.graphiti.driver)
     for episode in episodes:
         await episode.delete(app.state.graphiti.driver)
+    # Edges and episodes only capture relationships and source text — the
+    # entity nodes they reference are separate records and survive both
+    # loops above unless removed explicitly, leaving orphaned nodes behind.
+    await EntityNode.delete_by_group_id(app.state.graphiti.driver, group_id)
     return {"success": True}

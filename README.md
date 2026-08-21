@@ -2,6 +2,8 @@
 
 EedgeAI is a local-first agent and retrieval stack. Graphiti provides temporal knowledge extraction and hybrid retrieval, FalkorDB stores the graph and vectors, OpenClaw provides agent tools, Open WebUI provides chat, and MinIO preserves original documents.
 
+Conversational agents use OpenAI Codex first, Claude Code second, and local Ollama as the final fallback. Graphiti extraction and embeddings remain on Ollama by default because they are background OpenAI-compatible API workloads, separate from the interactive Codex and Claude Code runtimes.
+
 ## Current architecture
 
 ```text
