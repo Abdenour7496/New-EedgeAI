@@ -212,6 +212,8 @@ services:
       # Claude Code CLI's own login state (claude login) — separate from
       # OpenClaw's own config dir so the subscription auth survives restarts.
       - openclaw_claude_config:/home/node/.claude
+      # Codex CLI's own login state (codex login) — same rationale.
+      - openclaw_codex_config:/home/node/.codex
     healthcheck:
       test: ["CMD-SHELL", "bash -c ':> /dev/tcp/localhost/18799' || exit 0"]
       interval: 20s
@@ -451,6 +453,7 @@ volumes:
   qdrant_data:
   openclaw_config:
   openclaw_claude_config:
+  openclaw_codex_config:
   openwebui_data:
   ollama_data:
   docs_minio_data:

@@ -17,6 +17,16 @@ RUN mkdir -p /home/node/.claude && \
     ln -sf /home/node/.claude/.claude.json /home/node/.claude.json && \
     chown -R node:node /home/node/.claude /home/node/.claude.json
 
+# Codex CLI — the openclaw OpenAI plugin's "codex" backend shells out to this
+# for subscription-based auth (ChatGPT Plus/Pro/Business login), as opposed
+# to metered OPENAI_API_KEY billing. Login is an interactive OAuth/device-code
+# flow and has to be run by a human against a real TTY
+# (docker exec -it ... codex login, or --device-auth in headless setups) —
+# this just makes the binary available. Its auth/config lives under
+# ~/.codex (see the openclaw_codex_config volume for persistence).
+RUN npm install -g @openai/codex && npm cache clean --force && \
+    mkdir -p /home/node/.codex && chown -R node:node /home/node/.codex
+
 # Install document ingestion and MinIO dependencies outside OpenClaw internals.
 WORKDIR /opt/oc-drivers
 COPY openclaw/package.json .
