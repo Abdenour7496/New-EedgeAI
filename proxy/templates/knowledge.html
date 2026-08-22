@@ -546,6 +546,47 @@
 <div id="toast" class="toast"></div>
 
 <script>
+  // ── API auth ─────────────────────────────────────────────────────────────
+  // The proxy's /api/* now requires Authorization: Bearer <GCOR_API_KEY> once
+  // that's configured server-side (docs/adr/0002-proxy-api-authentication.md).
+  // This page has no login of its own — OpenWebUI is the authenticated
+  // user-facing surface; this is an operator tool — so it just asks for the
+  // shared key once and remembers it in this browser's localStorage, then
+  // transparently attaches it to every /api/ call below. A 401 clears the
+  // stored value so the next reload re-prompts (e.g. after the key rotates).
+  (function () {
+    const STORAGE_KEY = 'gcorApiKey';
+    function getToken() {
+      let t = localStorage.getItem(STORAGE_KEY);
+      if (t === null) {
+        t = window.prompt(
+          'GCOR API key (Authorization: Bearer token for this proxy).\n' +
+          'Leave blank if the proxy has no GCOR_API_KEY configured.',
+          ''
+        ) || '';
+        localStorage.setItem(STORAGE_KEY, t);
+      }
+      return t;
+    }
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+      init = init || {};
+      const url = typeof input === 'string' ? input : (input && input.url) || '';
+      if (url.startsWith('/api/')) {
+        const token = getToken();
+        if (token) {
+          init = Object.assign({}, init, {
+            headers: Object.assign({}, init.headers || {}, { Authorization: `Bearer ${token}` }),
+          });
+        }
+      }
+      return nativeFetch(input, init).then((r) => {
+        if (r.status === 401 && url.startsWith('/api/')) localStorage.removeItem(STORAGE_KEY);
+        return r;
+      });
+    };
+  })();
+
   let _testCol = null;
 
   // ── Load collections ───────────────────────────────────────────────────────

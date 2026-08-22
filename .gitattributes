@@ -1,0 +1,5 @@
+# Shell scripts run inside Linux containers — force LF regardless of the
+# checkout platform's core.autocrlf, otherwise a Windows checkout can produce
+# CRLF line endings that break the shebang inside the container ("bad
+# interpreter: ...: no such file or directory").
+*.sh text eol=lf

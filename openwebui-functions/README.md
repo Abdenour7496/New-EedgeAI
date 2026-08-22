@@ -149,8 +149,26 @@ the dropdown falls back to `documents`.
 
 ## Security
 
-This is routing metadata, not authorization. The current proxy accepts the
-collection selector from a trusted OpenWebUI request. Do not expose the proxy
-directly to untrusted clients if collection isolation is required. Enforce
-workspace-to-collection authorization at the proxy when an identity provider
-or access-control store, such as Supabase, is added.
+`gcor_collection` is routing metadata, not per-user authorization — any
+request carrying a valid `GCOR_API_KEY` can select any collection. As of
+docs/adr/0002-proxy-api-authentication.md the proxy does require that shared
+secret on every `/api/*` and `/v1/*` call (this Function reads it from the
+`GCOR_API_KEY` environment variable set on the OpenWebUI container, no
+per-Function configuration needed), which closes the "anyone who can reach
+the proxy" hole — but it does not give per-workspace or per-user isolation
+between collections. If that's required, enforce workspace-to-collection
+authorization at the proxy when a real identity provider or access-control
+store (e.g. Supabase) is added.
+
+## GCOR proxy authentication
+
+All three Functions call the GCOR proxy's `/api/*` endpoints, which require
+`Authorization: Bearer <GCOR_API_KEY>` once the proxy has that env var set
+(see docs/adr/0002-proxy-api-authentication.md). `gcor_file_ingest.py` and
+`gcor_chat_session_ingest.py` each expose a `gcor_api_key` Valve that defaults
+to this container's own `GCOR_API_KEY` environment variable automatically —
+in the normal case there's nothing to configure. Override the valve only if a
+Function needs to authenticate with a different key than the container's
+default. `gcor_collection_scope.py` reads the same environment variable
+directly (it has no per-instance Valve state available when populating its
+dropdown).

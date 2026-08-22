@@ -36,6 +36,10 @@ FAILED_PREFIX    = os.environ.get("S3_FAILED_PREFIX", "failed/")
 PROXY_INGEST_URL = os.environ.get("PROXY_INGEST_URL", "http://proxy:5001/api/ingest")
 POLL_INTERVAL    = float(os.environ.get("POLL_INTERVAL_SECONDS", "10"))
 
+# Must match the proxy's GCOR_API_KEY — see docs/adr/0002-proxy-api-authentication.md.
+# Empty is fine when the proxy itself has no GCOR_API_KEY configured (open dev mode).
+GCOR_API_KEY = os.environ.get("GCOR_API_KEY", "")
+
 INGEST_COLLECTION    = os.environ.get("INGEST_COLLECTION", "")
 INGEST_ENABLE_DOCINT = os.environ.get("INGEST_ENABLE_DOCINT", "false")
 INGEST_ACCESS_LEVEL  = os.environ.get("INGEST_ACCESS_LEVEL", "public")
@@ -80,8 +84,10 @@ def _ingest_one(key: str):
         "enable_docint": INGEST_ENABLE_DOCINT,
         "collection": INGEST_COLLECTION,
     }
+    headers = {"Authorization": f"Bearer {GCOR_API_KEY}"} if GCOR_API_KEY else {}
     try:
-        resp = httpx.post(PROXY_INGEST_URL, data=form, files={"file": (filename, data)}, timeout=300)
+        resp = httpx.post(PROXY_INGEST_URL, data=form, files={"file": (filename, data)},
+                           headers=headers, timeout=300)
         resp.raise_for_status()
         log.info("ingested %s -> document_id=%s", key, resp.json().get("document_id"))
         _move(key, f"{PROCESSED_PREFIX}{rel}")

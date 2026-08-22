@@ -8,6 +8,7 @@ required_open_webui_version: 0.10.0
 import asyncio
 import hashlib
 import logging
+import os
 from typing import Optional
 
 import httpx
@@ -58,6 +59,12 @@ class Filter:
         min_messages: int = Field(
             default=2,
             description="Skip ingesting a session until it has at least this many messages.",
+        )
+        gcor_api_key: str = Field(
+            default_factory=lambda: os.environ.get("GCOR_API_KEY", ""),
+            description="Shared secret the GCOR proxy requires on /api/* (its GCOR_API_KEY). "
+                        "Defaults to this container's own GCOR_API_KEY env var; override here "
+                        "only if this Function needs a different value.",
         )
         priority: int = Field(default=0)
 
@@ -151,9 +158,13 @@ class Filter:
             if self.valves.collection:
                 form["collection"] = self.valves.collection
 
+            proxy_headers = (
+                {"Authorization": f"Bearer {self.valves.gcor_api_key}"}
+                if self.valves.gcor_api_key else {}
+            )
             async with httpx.AsyncClient(timeout=60) as client:
                 ingest_resp = await client.post(
-                    self.valves.proxy_ingest_url, json=form, timeout=60,
+                    self.valves.proxy_ingest_url, json=form, headers=proxy_headers, timeout=60,
                 )
                 ingest_resp.raise_for_status()
 

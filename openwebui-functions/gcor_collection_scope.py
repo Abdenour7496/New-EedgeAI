@@ -6,8 +6,9 @@ required_open_webui_version: 0.10.0
 """
 
 import json
+import os
 from typing import Optional
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from pydantic import BaseModel, Field
 
@@ -35,7 +36,16 @@ class Filter:
         def get_collection_options(cls) -> list[dict[str, str]]:
             """List active Graphiti groups from the GCOR proxy for the valve dropdown."""
             try:
-                with urlopen("http://proxy:5001/api/collections", timeout=3) as response:
+                # This is a classmethod invoked to populate a dropdown, without
+                # an instantiated Filter (so no self.valves) — read the shared
+                # secret straight from this container's own env instead. See
+                # docs/adr/0002-proxy-api-authentication.md.
+                api_key = os.environ.get("GCOR_API_KEY", "")
+                req = Request(
+                    "http://proxy:5001/api/collections",
+                    headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
+                )
+                with urlopen(req, timeout=3) as response:
                     payload = json.load(response)
                 names = sorted(
                     collection["name"]

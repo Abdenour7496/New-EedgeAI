@@ -1,8 +1,9 @@
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Literal, get_args, get_origin
 
 from fastapi import FastAPI, HTTPException, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
@@ -16,6 +17,95 @@ from graphiti_core.edges import EntityEdge
 from graphiti_core.llm_client.config import LLMConfig
 from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
+from graphiti_core.prompts.dedupe_edges import EdgeDuplicate
+from graphiti_core.prompts.dedupe_nodes import NodeResolutions
+from graphiti_core.prompts.extract_edges import ExtractedEdges, MissingFacts
+from graphiti_core.prompts.extract_nodes import EntitySummary, ExtractedEntities
+from graphiti_core.prompts.invalidate_edges import InvalidatedEdges
+from graphiti_core.prompts.summarize_nodes import Summary, SummaryDescription
+
+# ── Hotfix: tolerate malformed structured-output responses from small/local
+#    LLMs across every graphiti-core 0.22.0 response model ───────────────────
+# Every one of these Pydantic models is what graphiti-core asks the LLM to
+# fill in as structured JSON (edge_operations.py, node_operations.py, etc.),
+# then constructs directly via `Model(**llm_response)` — no fault tolerance
+# for a partial response. A local CPU-bound model like qwen2.5:7b sometimes
+# omits required keys, or — observed directly during validation — even
+# echoes back the JSON *schema* itself (`$defs`/`title` keys) instead of
+# actual data. Either way this used to raise a pydantic ValidationError and
+# crash the entire ingest (500) instead of degrading gracefully for just that
+# one step. Each field's own description already documents its intended
+# fallback ("If no duplicate facts are found, default to empty list", "One of
+# the provided fact types or DEFAULT") — this patch makes those defaults real
+# instead of merely documented. A well-formed LLM response is unaffected;
+# verified directly against the installed graphiti-core==0.22.0 package
+# before merging (defaults for all 9 models below with fully-empty input, and
+# a normal case round-tripping correctly). See
+# docs/adr/0003-graphiti-edgeduplicate-hotfix.md.
+#
+# Not covered: custom user-defined entity/edge types (`response_model=
+# entity_type` / `edge_model` in node_operations.py / edge_operations.py) —
+# those are runtime-supplied classes, not statically enumerable here. This
+# repo doesn't configure custom entity/edge types by default.
+_graphiti_hotfix_logger = logging.getLogger("graphiti_hotfix")
+
+# Per-field overrides where the field's own docstring names a specific
+# fallback more precise than the generic type-based default below.
+_FIELD_DEFAULT_OVERRIDES = {
+    (EdgeDuplicate, "fact_type"): "DEFAULT",
+}
+
+
+def _default_for_annotation(annotation):
+    origin = get_origin(annotation)
+    if origin is list:
+        return []
+    if origin is dict:
+        return {}
+    args = get_args(annotation)
+    if origin is not None and type(None) in args:
+        return None
+    if annotation is int:
+        return 0
+    if annotation is float:
+        return 0.0
+    if annotation is bool:
+        return False
+    if annotation is str:
+        return ""
+    return None
+
+
+def _make_lenient(model_cls):
+    """Patch one graphiti-core response model in place so missing required
+    fields get a safe default instead of raising ValidationError."""
+    original_init = model_cls.__init__
+
+    def _lenient_init(self, **data):
+        missing = []
+        for name, field in model_cls.model_fields.items():
+            if name in data or not field.is_required():
+                continue
+            missing.append(name)
+            data[name] = _FIELD_DEFAULT_OVERRIDES.get(
+                (model_cls, name), _default_for_annotation(field.annotation)
+            )
+        if missing:
+            _graphiti_hotfix_logger.warning(
+                "LLM response for %s missing required field(s) %s — "
+                "defaulting instead of failing the ingest.",
+                model_cls.__name__, missing,
+            )
+        original_init(self, **data)
+
+    model_cls.__init__ = _lenient_init
+
+
+for _model_cls in (
+    EdgeDuplicate, ExtractedEntities, EntitySummary, NodeResolutions,
+    Summary, SummaryDescription, InvalidatedEdges, ExtractedEdges, MissingFacts,
+):
+    _make_lenient(_model_cls)
 
 
 class Message(BaseModel):

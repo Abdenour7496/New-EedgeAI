@@ -1,0 +1,113 @@
+{
+  "gateway": {
+    "mode": "local",
+    "auth": {
+      "mode": "token"
+    },
+    "controlUi": {
+      "allowedOrigins": [
+        "http://localhost:18789",
+        "http://127.0.0.1:18789"
+      ]
+    },
+    "http": {
+      "endpoints": {
+        "chatCompletions": {
+          "enabled": true
+        }
+      }
+    }
+  },
+  "models": {
+    "providers": {
+      "ollama": {
+        "baseUrl": "http://ollama:11434",
+        "apiKey": "ollama-local",
+        "api": "ollama",
+        "models": [
+          {
+            "id": "deepseek-r1:32b",
+            "name": "deepseek-r1:32b",
+            "api": "ollama",
+            "reasoning": true,
+            "input": ["text"],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 128000,
+            "maxTokens": 8192
+          },
+          {
+            "id": "llama3.2:latest",
+            "name": "llama3.2:latest",
+            "api": "ollama",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 128000,
+            "maxTokens": 8192
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "ollama/deepseek-r1:32b",
+        "fallbacks": [
+          "anthropic/claude-sonnet-4-6",
+          "openai/gpt-5.6-sol"
+        ]
+      },
+      "models": {
+        "ollama/deepseek-r1:32b": {
+          "alias": "local"
+        },
+        "anthropic/claude-sonnet-4-6": {
+          "alias": "claude",
+          "agentRuntime": {
+            "id": "claude-cli"
+          }
+        },
+        "openai/gpt-5.6-sol": {
+          "alias": "codex",
+          "agentRuntime": {
+            "id": "codex"
+          }
+        }
+      },
+      "memorySearch": {
+        "provider": "ollama",
+        "fallback": "none",
+        "model": "nomic-embed-text",
+        "outputDimensionality": 768
+      },
+      "heartbeat": {
+        "model": "ollama/llama3.2:latest"
+      }
+    }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true
+    }
+  },
+  "mcp": {
+    "servers": {
+      "graphiti-memory": {
+        "type": "http",
+        "url": "http://graphiti-mcp-proxy:8000/mcp"
+      }
+    }
+  },
+  "auth": { "profiles": {} }
+}

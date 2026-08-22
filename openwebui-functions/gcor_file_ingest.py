@@ -7,6 +7,7 @@ required_open_webui_version: 0.10.0
 
 import asyncio
 import logging
+import os
 from typing import Optional
 
 import httpx
@@ -49,6 +50,12 @@ class Filter:
         enable_docint: bool = Field(
             default=False,
             description="Run full Document Intelligence (OCR, tables, entities) on attached files.",
+        )
+        gcor_api_key: str = Field(
+            default_factory=lambda: os.environ.get("GCOR_API_KEY", ""),
+            description="Shared secret the GCOR proxy requires on /api/* (its GCOR_API_KEY). "
+                        "Defaults to this container's own GCOR_API_KEY env var; override here "
+                        "only if this Function needs a different value.",
         )
         priority: int = Field(default=0)
 
@@ -122,10 +129,15 @@ class Filter:
                     "enable_docint": "true" if self.valves.enable_docint else "false",
                     "collection": self.valves.collection,
                 }
+                proxy_headers = (
+                    {"Authorization": f"Bearer {self.valves.gcor_api_key}"}
+                    if self.valves.gcor_api_key else {}
+                )
                 ingest_resp = await client.post(
                     self.valves.proxy_ingest_url,
                     data=form,
                     files={"file": (filename, data)},
+                    headers=proxy_headers,
                     timeout=300,
                 )
                 ingest_resp.raise_for_status()

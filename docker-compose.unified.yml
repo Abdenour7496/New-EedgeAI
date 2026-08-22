@@ -4,9 +4,13 @@ services:
 
   falkordb:
     image: falkordb/falkordb:latest
+    # Bound to localhost only: this is the graph/vector store, not a public
+    # surface — other containers reach it over the docker network by service
+    # name regardless of host port bindings. Reach it from the host itself via
+    # SSH tunnel / kubectl port-forward for the browser UI or redis-cli.
     ports:
-      - "6379:6379"
-      - "3001:3000"
+      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:3001:3000"
     environment:
       FALKORDB_PASSWORD: ${FALKORDB_PASSWORD:-}
       REDIS_ARGS: --appendonly yes --appendfsync everysec
@@ -20,11 +24,16 @@ services:
       retries: 12
       start_period: 10s
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4g
 
   graphiti:
     build: ./graphiti
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       OPENAI_BASE_URL: ${GRAPHITI_API_BASE_URL:-http://ollama:11434/v1}
       OPENAI_API_KEY: ${GRAPHITI_API_KEY:-ollama}
@@ -33,6 +42,11 @@ services:
       EMBEDDING_DIM: ${GRAPHITI_EMBEDDING_DIM:-768}
       FALKORDB_HOST: falkordb
       FALKORDB_PORT: "6379"
+      # Was missing here even though graphiti/app.py reads it (falkordb_driver
+      # password=os.getenv("FALKORDB_PASSWORD") or None) — meant this service
+      # would fail to authenticate the moment FALKORDB_PASSWORD was ever set,
+      # since only falkordb/graphiti-mcp/falkordb-exporter received it.
+      FALKORDB_PASSWORD: ${FALKORDB_PASSWORD:-}
       FALKORDB_DATABASE: ${FALKORDB_DATABASE:-eedgeai}
       db_backend: falkordb
       # Graphiti 0.22.0 marks these optional fields as required during settings
@@ -54,6 +68,11 @@ services:
       retries: 12
       start_period: 45s
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4g
 
   graphiti-mcp:
     image: zepai/knowledge-graph-mcp:standalone
@@ -84,6 +103,11 @@ services:
       retries: 12
       start_period: 45s
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4g
 
   # Rewrites the Host header to something graphiti-mcp's DNS-rebinding
   # allowlist accepts (see graphiti-mcp/nginx.conf) — OpenClaw talks to this,
@@ -108,7 +132,7 @@ services:
   ollama:
     image: ollama/ollama:latest
     ports:
-      - "11434:11434"
+      - "127.0.0.1:11434:11434"
     volumes:
       - ollama_data:/root/.ollama
     # Uncomment to enable NVIDIA GPU acceleration:
@@ -126,6 +150,15 @@ services:
       retries: 5
       start_period: 30s
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          # Ollama is the heaviest CPU/RAM consumer in this stack — raise this
+          # for larger models (see project_production_local_llm_goal memory /
+          # the DeepSeek sizing discussion) and prefer the commented GPU block
+          # above once running on GPU nodes.
+          cpus: "4"
+          memory: 12g
 
   ollama-init:
     image: ollama/ollama:latest
@@ -168,11 +201,15 @@ services:
         condition: service_completed_successfully
       graphiti-mcp-proxy:
         condition: service_healthy
+    # OpenClaw is an operator/agent-gateway surface, not the end-user product —
+    # OpenWebUI is (see docs/adr/0002-proxy-api-authentication.md). Reach these
+    # from the host via SSH tunnel / kubectl port-forward; proxy/openclaw talk
+    # to it over the docker network regardless of host port bindings.
     ports:
-      - "18789:18789"
-      - "18799:18799"
-      - "18801:18801"
-      - "9091:9091"
+      - "127.0.0.1:18789:18789"
+      - "127.0.0.1:18799:18799"
+      - "127.0.0.1:18801:18801"
+      - "127.0.0.1:9091:9091"
     environment:
       # Deliberately NOT set here (unlike the proxy service, which has its own
       # copy for RAG/vision calls): the bundled `claude` CLI prefers
@@ -221,19 +258,33 @@ services:
       retries: 5
       start_period: 30s
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4g
 
   # ── GCOR Proxy ────────────────────────────────────────────────────────────────
 
   proxy:
     build: ./proxy
+    # Operator/ingest surface (Knowledge UI, direct curl) — OpenWebUI (8080) is
+    # the end-user front door. Localhost-only by default; tunnel in for admin
+    # use. OpenWebUI/Functions/ingest-watcher reach this over the docker
+    # network regardless of the host port binding.
     ports:
-      - "5001:5001"
+      - "127.0.0.1:5001:5001"
     depends_on:
       graphiti:
         condition: service_healthy
       ollama:
         condition: service_healthy
     environment:
+      # Shared secret required on /api/* and /v1/* — see
+      # docs/adr/0002-proxy-api-authentication.md. Must match what's
+      # configured on openwebui, ingest-watcher, and each gcor_* Function's
+      # gcor_api_key valve.
+      GCOR_API_KEY: ${GCOR_API_KEY:-}
       # OpenClaw routes Codex -> Claude Code -> local Ollama.
       LLM_BACKEND: ${LLM_BACKEND:-openclaw}
       VISION_BACKEND: ${VISION_BACKEND:-anthropic}
@@ -286,15 +337,23 @@ services:
       retries: 3
       start_period: 10s
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g
 
   # ── Document storage (MinIO, S3-compatible) ───────────────────────────────────
 
   minio:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
+    # Admin/API surface, not for end users — bind locally, tunnel in for the
+    # console; internal S3 traffic (proxy, ingest-watcher, openwebui) is over
+    # the docker network and unaffected by this.
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     environment:
       MINIO_ROOT_USER: ${DOCS_S3_ACCESS_KEY:-gcor_docs}
       MINIO_ROOT_PASSWORD: ${DOCS_S3_SECRET_KEY:-gcor_docs_secret}
@@ -307,6 +366,11 @@ services:
       retries: 12
       start_period: 10s
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g
 
   minio-init:
     image: minio/mc:latest
@@ -350,14 +414,22 @@ services:
       INGEST_COLLECTION: ${GRAPHITI_GROUP_ID:-documents}
       INGEST_ENABLE_DOCINT: ${INGEST_ENABLE_DOCINT:-false}
       INGEST_ACCESS_LEVEL: ${DEFAULT_ACCESS_LEVEL:-public}
+      # Must match the proxy's GCOR_API_KEY — see
+      # docs/adr/0002-proxy-api-authentication.md.
+      GCOR_API_KEY: ${GCOR_API_KEY:-}
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512m
 
   # ── TTS (OpenAI-compatible Edge TTS) ─────────────────────────────────────────
 
   tts:
     image: travisvn/openai-edge-tts:latest
     ports:
-      - "5050:5050"
+      - "127.0.0.1:5050:5050"
     environment:
       PORT: "5050"
       API_KEY: ${TTS_API_KEY:-tts-local}
@@ -371,14 +443,32 @@ services:
 
   openwebui:
     image: ghcr.io/open-webui/open-webui:v0.11.0
+    # The one port meant for end users (see docs/adr/0002-proxy-api-authentication.md).
+    # Put a real TLS-terminating reverse proxy in front of this for anything
+    # beyond a trusted LAN — this compose file does not provide one.
     ports:
       - "8080:8080"
     environment:
+      # Persistent signing key for session/JWT auth — without this OpenWebUI
+      # generates a random one on every restart, invalidating every logged-in
+      # session. Change the default before exposing this beyond a dev box.
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:-changeme-set-a-real-secret}
+      # Closed after the first admin account is created. OpenWebUI allows the
+      # very first signup regardless of this setting so there's always a way
+      # to bootstrap an admin; verify this against the pinned v0.11.0 behavior
+      # before relying on it in production.
+      ENABLE_SIGNUP: ${OPENWEBUI_ENABLE_SIGNUP:-false}
+      # Also readable directly by the gcor_* Functions' Python code (they run
+      # inside this container) so their `gcor_api_key` valve can default to it
+      # automatically instead of every admin re-typing the secret per Function.
+      GCOR_API_KEY: ${GCOR_API_KEY:-}
       OPENAI_API_BASE_URL: http://proxy:5001/v1
-      OPENAI_API_KEY: openclaw
+      # Real shared secret instead of the fixed string "openclaw" — must match
+      # the proxy's GCOR_API_KEY.
+      OPENAI_API_KEY: ${GCOR_API_KEY:-openclaw}
       RAG_EMBEDDING_ENGINE: openai
       RAG_OPENAI_API_BASE_URL: http://proxy:5001/v1
-      RAG_OPENAI_API_KEY: openclaw
+      RAG_OPENAI_API_KEY: ${GCOR_API_KEY:-openclaw}
       ENABLE_RAG_LOCAL_WEB_FETCH: "false"
       # Ollama — fallback model when Anthropic is unavailable
       OLLAMA_BASE_URL: http://ollama:11434
@@ -412,6 +502,11 @@ services:
       minio-init:
         condition: service_completed_successfully
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g
 
   # ── Monitoring ────────────────────────────────────────────────────────────────
 
@@ -430,26 +525,71 @@ services:
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     depends_on:
       graphiti:
         condition: service_healthy
       falkordb-exporter:
         condition: service_started
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1g
 
   grafana:
     image: grafana/grafana
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+      # Default admin/admin otherwise — change before any non-localhost access.
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-changeme}
     volumes:
       - ./monitoring/grafana-dashboard.json:/var/lib/grafana/dashboards/dashboard.json
       - ./monitoring/grafana-provisioning:/etc/grafana/provisioning
     depends_on:
       - prometheus
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512m
+
+  # ── Backups ───────────────────────────────────────────────────────────────────
+  # Periodically snapshots FalkorDB (the graph/vector source of truth) and
+  # mirrors the MinIO documents bucket (originals + chat-session archives) to
+  # ./backups on the host. This is the automated replacement for the single
+  # stale manual `backups/webui-backup-*.db` snapshot found during the
+  # production-readiness review — see backup/README.md for restore steps and
+  # the retention policy.
+  backup:
+    build: ./backup
+    environment:
+      FALKORDB_HOST: falkordb
+      FALKORDB_PORT: "6379"
+      FALKORDB_PASSWORD: ${FALKORDB_PASSWORD:-}
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: ${DOCS_S3_ACCESS_KEY:-gcor_docs}
+      S3_SECRET_KEY: ${DOCS_S3_SECRET_KEY:-gcor_docs_secret}
+      S3_BUCKET: ${DOCS_S3_BUCKET:-documents}
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-21600}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+    volumes:
+      - ./backups:/backups
+    depends_on:
+      falkordb:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512m
 
 volumes:
   falkordb_data:

@@ -64,6 +64,40 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
+# ── API authentication ────────────────────────────────────────────────────────
+# GCOR_API_KEY is a shared secret every trusted caller (OpenWebUI, its Functions,
+# ingest-watcher, admin scripts/curl) must present as `Authorization: Bearer
+# <key>`. Without it, /api/* and /v1/* accept requests from anyone who can
+# reach this port — see docs/adr/0002-proxy-api-authentication.md.
+#
+# If GCOR_API_KEY is unset, auth is left OPEN (dev convenience, matches this
+# repo's pattern of degrading gracefully rather than crashing on missing
+# config) but it's loud about it so this can't be silently shipped to
+# production.
+GCOR_API_KEY = os.getenv("GCOR_API_KEY", "")
+if not GCOR_API_KEY:
+    logger.warning(
+        "GCOR_API_KEY is not set — /api/* and /v1/* endpoints are UNAUTHENTICATED. "
+        "Set GCOR_API_KEY before exposing this stack beyond a trusted dev network."
+    )
+
+# Paths that stay open even with GCOR_API_KEY configured: static HTML pages
+# (they carry no data themselves) and liveness/metrics probes.
+_AUTH_EXEMPT_PATHS = {"/knowledge", "/openclaw", "/health", "/metrics", "/docs", "/openapi.json"}
+
+
+@app.middleware("http")
+async def _require_api_key(request: Request, call_next):
+    path = request.url.path
+    needs_auth = (path.startswith("/api/") or path.startswith("/v1/")) and path not in _AUTH_EXEMPT_PATHS
+    if needs_auth and GCOR_API_KEY:
+        header = request.headers.get("authorization", "")
+        scheme, _, token = header.partition(" ")
+        if scheme.lower() != "bearer" or not hmac.compare_digest(token, GCOR_API_KEY):
+            return JSONResponse(status_code=401, content={"detail": "Missing or invalid API key"})
+    return await call_next(request)
+
+
 # ── Prometheus metrics ─────────────────────────────────────────────────────────
 
 # Auto-instruments HTTP request count + latency for every FastAPI endpoint
@@ -1860,6 +1894,13 @@ async def api_search(
         hits, _ = await graphiti_search(q, collection)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
+
+    # Apply the same confidence/temporal-validity/access-control filtering the
+    # chat RAG path uses (_run_chat_completion) — this endpoint used to return
+    # raw hits, which meant a document marked access_level="restricted" (or
+    # expired, or below CONFIDENCE_THRESHOLD) was hidden from chat but still
+    # fully readable here. Keep both paths honoring the same policy.
+    hits = _filter_hits(hits)
 
     results = [
         {
