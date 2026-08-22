@@ -254,6 +254,12 @@ services:
       GRAPHITI_URL: http://graphiti:8000
       GRAPHITI_GROUP_ID: ${GRAPHITI_GROUP_ID:-documents}
       GRAPHITI_TOP_K: ${GRAPHITI_TOP_K:-8}
+      # Separate group for archived chat-session transcripts (POST /api/ingest/session),
+      # kept apart from GRAPHITI_GROUP_ID so document RAG isn't diluted by conversation history.
+      GRAPHITI_CHAT_SESSIONS_GROUP_ID: ${GRAPHITI_CHAT_SESSIONS_GROUP_ID:-chat_sessions}
+      # How long the proxy waits for Graphiti extraction before erroring — CPU-only
+      # local extraction can take several minutes per call (see README trade-offs).
+      GRAPHITI_INGEST_TIMEOUT_SECONDS: ${GRAPHITI_INGEST_TIMEOUT_SECONDS:-1800}
       # OpenClaw backend
       OPENCLAW_BASE_URL: ${OPENCLAW_BASE_URL:-http://openclaw:18799/v1}
       OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:-}

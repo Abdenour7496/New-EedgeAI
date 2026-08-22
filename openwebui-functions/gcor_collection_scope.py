@@ -18,7 +18,7 @@ class Filter:
     class Valves(BaseModel):
         collection: str = Field(
             default="documents",
-            description="GCOR/Qdrant collection used for this workspace or model.",
+            description="Graphiti group used for this workspace or model.",
             json_schema_extra={
                 "input": {
                     "type": "select",
@@ -33,7 +33,7 @@ class Filter:
 
         @classmethod
         def get_collection_options(cls) -> list[dict[str, str]]:
-            """List active collections from the GCOR proxy for the valve dropdown."""
+            """List active Graphiti groups from the GCOR proxy for the valve dropdown."""
             try:
                 with urlopen("http://proxy:5001/api/collections", timeout=3) as response:
                     payload = json.load(response)
@@ -42,16 +42,7 @@ class Filter:
                     for collection in payload.get("collections", [])
                     if collection.get("name") and not collection["name"].startswith("_")
                 )
-                options = [{"value": name, "label": name} for name in names]
-                if any(
-                    collection.get("name") == "_doc_archive"
-                    for collection in payload.get("collections", [])
-                ):
-                    options.append({
-                        "value": "_doc_archive",
-                        "label": "Archives (archived documents)",
-                    })
-                return options
+                return [{"value": name, "label": name} for name in names]
             except Exception:
                 return [{"value": "documents", "label": "documents"}]
 

@@ -3,46 +3,33 @@ Graph-Centric Orchestrated Retrieval (GCOR) proxy — Cognitive Infrastructure.
 
 Architecture
 ────────────
-  Neo4j   = cognitive backbone   (primary truth, structure, reasoning)
-  Qdrant  = semantic perception  (index over Neo4j nodes, similarity only)
+  Graphiti = knowledge backend (temporal episodes, entity/fact extraction,
+             hybrid semantic + keyword + graph + temporal retrieval)
+  FalkorDB = storage for Graphiti's graph structure and vector indexes
+  MinIO    = durable original-file storage (S3-compatible), keyed by doc_id
 
-─────────────────────────────────────────────────────────────────────────────
-Cognitive infrastructure additions over baseline GCOR:
-
-  Confidence filtering
-    • Qdrant hits below CONFIDENCE_THRESHOLD are dropped before expansion
-    • Neo4j expansion uses $min_conf to filter Memory/Inference/Belief
-
-  Temporal validity
-    • Qdrant hits with expired valid_to are dropped (dead knowledge)
-    • Neo4j expansion passes $now so queries respect valid_to
-
-  Agent partitioning
-    • AGENT_ID env var scopes Memory/Belief/Inference to one agent
-    • Access-control filter drops hits whose access_level forbids $AGENT_ID
-
-  New intents
-    • inference   → resolve :Inference chains and their evidence
-    • belief      → retrieve :Belief nodes and contradiction graph
+This replaced an earlier Neo4j + Qdrant dual-write design — see
+docs/adr/0001-graphiti-falkordb-backend.md for the migration rationale.
+Confidence filtering, temporal validity, and agent/access-level partitioning
+are still applied client-side in _filter_hits() over Graphiti's results.
 
 ─────────────────────────────────────────────────────────────────────────────
 Retrieval flow for every /v1/chat/completions request
 ─────────────────────────────────────────────────────
   1. INTENT CLASSIFICATION
      factual | planning | dependency | memory | semantic | inference | belief
+     (used for context formatting/logging; Graphiti's search is not
+     intent-specific — see build_gcor_context())
 
-  2. SEMANTIC PHASE  (Qdrant)
-     Embed → top-K candidate nodes
-     Filter by: score, confidence, temporal validity, access control
+  2. HYBRID RETRIEVAL  (Graphiti / FalkorDB)
+     graphiti_search() → temporal facts, min-max normalised and filtered by
+     score, confidence, temporal validity, and access control (_filter_hits)
 
-  3. STRUCTURAL PHASE  (Neo4j)
-     Intent-specific Cypher with confidence + temporal + agent_id params
-
-  4. REFLECTION CHECK
-     Neo4j empty but Qdrant has hits → fall back to chunk text
+  3. REFLECTION CHECK
+     No graph records but facts exist → fall back to fact text
      Both empty → LLM general knowledge
 
-  5. CONTEXT INJECTION
+  4. CONTEXT INJECTION
      Structured system message including confidence scores
 
 Other endpoints
@@ -68,7 +55,6 @@ from datetime import datetime, timezone
 import httpx
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
-from neo4j import AsyncGraphDatabase
 from prometheus_client import Counter, Histogram
 from prometheus_fastapi_instrumentator import Instrumentator
 from document_intel import process_document, DocIntelResult
@@ -179,6 +165,14 @@ LLM_RETRY_BASE    = float(os.getenv("LLM_RETRY_BASE",  "1.0"))   # base delay fo
 GRAPHITI_URL      = os.getenv("GRAPHITI_URL", "http://graphiti:8000").rstrip("/")
 GRAPHITI_GROUP_ID = os.getenv("GRAPHITI_GROUP_ID", "documents")
 GRAPHITI_TOP_K    = int(os.getenv("GRAPHITI_TOP_K", "8"))
+# Local CPU-only extraction (the default qwen2.5:7b via Ollama) can take
+# several minutes per ingest call, especially with multiple chunks — each
+# chunk is a sequential LLM extraction inside Graphiti. 300s was observed to
+# be too short even for a 2-message chat session on CPU-only hardware, which
+# surfaced as a 502 to the caller despite the episode landing successfully a
+# short time later. A hosted OpenAI-compatible GRAPHITI_API_BASE_URL will
+# need far less of this margin.
+GRAPHITI_INGEST_TIMEOUT_SECONDS = float(os.getenv("GRAPHITI_INGEST_TIMEOUT_SECONDS", "1800"))
 
 # Compatibility aliases retained for the existing Knowledge UI route names.
 QDRANT_COLLECTION = GRAPHITI_GROUP_ID
@@ -196,12 +190,6 @@ async def _get_embed_dim() -> int:
     vec = await embed_text("dimension probe")
     _embed_dim_cache = len(vec) if vec else 768
     return _embed_dim_cache
-
-# ── Neo4j (cognitive backbone) ────────────────────────────────────────────────
-NEO4J_URI      = os.getenv("NEO4J_URI",      "bolt://neo4j:7687")
-NEO4J_USER     = os.getenv("NEO4J_USER",     "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "test1234")
-NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
 
 ENABLE_RAG = os.getenv("ENABLE_RAG", "true").lower() in ("true", "1", "yes")
 
@@ -260,7 +248,7 @@ async def graphiti_ingest(
             "timestamp": now,
             "source_description": source,
         })
-    async with httpx.AsyncClient(timeout=300) as client:
+    async with httpx.AsyncClient(timeout=GRAPHITI_INGEST_TIMEOUT_SECONDS) as client:
         response = await client.post(
             f"{GRAPHITI_URL}/messages", json={"group_id": group_id, "messages": messages}
         )
@@ -602,51 +590,6 @@ async def embed_text(text: str) -> list | None:
         return None
 
 
-async def _qdrant_search_collection(
-    client: httpx.AsyncClient, collection: str, vector: list, limit: int,
-) -> list:
-    """Search a single Qdrant collection with server-side temporal filters.
-
-    Qdrant pre-filters out expired (valid_to < now) and not-yet-valid
-    (valid_from > now) points so they never consume top-K slots.
-    """
-    now = _now_iso()
-    payload_filter = {
-        "must": [
-            # Exclude expired: valid_to must be null or >= now
-            {"should": [
-                {"is_empty": {"key": "valid_to"}},
-                {"key": "valid_to", "range": {"gte": now}},
-            ]},
-            # Exclude not-yet-valid: valid_from must be null or <= now
-            {"should": [
-                {"is_empty": {"key": "valid_from"}},
-                {"key": "valid_from", "range": {"lte": now}},
-            ]},
-        ],
-    }
-    try:
-        resp = await client.post(
-            f"{QDRANT_URL}/collections/{collection}/points/search",
-            json={
-                "vector": vector,
-                "limit": limit,
-                "with_payload": True,
-                "filter": payload_filter,
-            },
-        )
-        if resp.status_code == 404:
-            return []
-        resp.raise_for_status()
-        hits = resp.json().get("result", [])
-        for h in hits:
-            h.setdefault("_collection", collection)
-        return hits
-    except Exception as exc:
-        logger.warning("Qdrant search on '%s' failed: %s", collection, exc)
-        return []
-
-
 # Collections to search during RAG (in addition to QDRANT_COLLECTION).
 # Only collections whose dimension matches the active embedding model are queried.
 RAG_EXTRA_COLLECTIONS = [
@@ -671,66 +614,6 @@ def _request_rag_collection(body: dict, request: Request) -> str | None:
     if len(collection) > 255 or any(char in collection for char in "/\\?#"):
         raise HTTPException(status_code=400, detail="Invalid gcor_collection")
     return collection
-
-
-async def qdrant_search(vector: list, collection: str | None = None) -> list:
-    """Search one selected collection or the default collection set.
-
-    Each collection's scores are min-max normalised to [0, 1] before merging
-    so that differences in corpus size or score distributions don't bias results.
-    The top QDRANT_TOP_K results across all collections are returned.
-    """
-    embed_dim = len(vector)
-    collections = [collection or QDRANT_COLLECTION]
-
-    # A workspace-selected collection is an explicit scope. Default requests
-    # retain the existing behavior of searching configured extra collections.
-    async with httpx.AsyncClient(timeout=10) as c:
-        if collection is None:
-            for name in RAG_EXTRA_COLLECTIONS:
-                if name == QDRANT_COLLECTION:
-                    continue
-                try:
-                    info = await c.get(f"{QDRANT_URL}/collections/{name}")
-                    if info.status_code != 200:
-                        continue
-                    col_dim = (info.json().get("result", {})
-                               .get("config", {}).get("params", {})
-                               .get("vectors", {}).get("size"))
-                    if col_dim == embed_dim:
-                        collections.append(name)
-                    else:
-                        logger.debug(
-                            "Skipping collection '%s': dim %s != embed dim %s",
-                            name, col_dim, embed_dim,
-                        )
-                except Exception:
-                    pass
-
-        # Search all matching collections concurrently
-        per_col = max(QDRANT_TOP_K, 12)  # fetch extra so normalisation is stable
-        tasks = [
-            _qdrant_search_collection(c, col, vector, per_col)
-            for col in collections
-        ]
-        results = await asyncio.gather(*tasks)
-
-    # Min-max normalise scores per collection then merge
-    all_hits: list = []
-    for hits in results:
-        if not hits:
-            continue
-        scores = [h.get("score", 0) for h in hits]
-        lo, hi = min(scores), max(scores)
-        span = hi - lo if hi > lo else 1.0
-        for h in hits:
-            h["_raw_score"] = h.get("score", 0)
-            h["score"] = (h["_raw_score"] - lo) / span
-        all_hits.extend(hits)
-
-    # Sort by normalised score descending, take top-K
-    all_hits.sort(key=lambda h: h["score"], reverse=True)
-    return all_hits[:QDRANT_TOP_K]
 
 
 def _filter_hits(hits: list) -> list:
@@ -777,233 +660,13 @@ def _filter_hits(hits: list) -> list:
     return filtered
 
 
-# ── Step 2b: Structural phase (Neo4j) ─────────────────────────────────────────
-
-_EXPAND_CYPHER = {
-    "factual": """
-        MATCH (n) WHERE elementId(n) IN $ids
-          AND (n.valid_from IS NULL OR n.valid_from <= $now)
-          AND (n.valid_to   IS NULL OR n.valid_to   >= $now)
-        OPTIONAL MATCH (n)-[r]-(related)
-          WHERE (related.valid_to IS NULL OR related.valid_to >= $now)
-                OPTIONAL MATCH (doc:Document)-[doc_rel]->(n)
-                    WHERE type(doc_rel) IN ['HAS_CHUNK', 'CONTAINS']
-        RETURN
-            properties(n) AS node, labels(n) AS labels,
-            properties(doc) AS document,
-            collect(DISTINCT {
-                rel: type(r), props: properties(related), lbls: labels(related)
-            })[..6] AS related
-        LIMIT 20
-    """,
-    "planning": """
-        MATCH (n) WHERE elementId(n) IN $ids
-          AND (n.valid_from IS NULL OR n.valid_from <= $now)
-          AND (n.valid_to   IS NULL OR n.valid_to   >= $now)
-        OPTIONAL MATCH (n)-[:DEPENDS_ON*1..2]->(dep)
-                OPTIONAL MATCH (doc:Document)-[doc_rel]->(n)
-                    WHERE type(doc_rel) IN ['HAS_CHUNK', 'CONTAINS']
-        OPTIONAL MATCH (g:Goal)-[:DEPENDS_ON]->(n)
-            WHERE (g.valid_to IS NULL OR g.valid_to >= $now)
-        OPTIONAL MATCH (infer_node:Inference)-[:SUPPORTS]->(n)
-            WHERE infer_node.confidence >= $min_conf
-              AND (infer_node.valid_to IS NULL OR infer_node.valid_to >= $now)
-        RETURN
-            properties(n) AS node, labels(n) AS labels,
-            properties(doc) AS document,
-            collect(DISTINCT properties(dep))[..5]       AS dependencies,
-            collect(DISTINCT properties(g))[..5]         AS blocking_goals,
-            collect(DISTINCT properties(infer_node))[..3] AS supporting_inferences
-        LIMIT 20
-    """,
-    "dependency": """
-        MATCH (n) WHERE elementId(n) IN $ids
-          AND (n.valid_from IS NULL OR n.valid_from <= $now)
-          AND (n.valid_to   IS NULL OR n.valid_to   >= $now)
-        OPTIONAL MATCH path = (n)-[:DEPENDS_ON*1..3]->(dep)
-                OPTIONAL MATCH (doc:Document)-[doc_rel]->(n)
-                    WHERE type(doc_rel) IN ['HAS_CHUNK', 'CONTAINS']
-        RETURN
-            properties(n)  AS node, labels(n) AS labels,
-            properties(doc) AS document,
-            [x IN nodes(path) | properties(x)][..8] AS dependency_chain
-        LIMIT 20
-    """,
-    "memory": """
-        MATCH (n) WHERE elementId(n) IN $ids
-          AND (n.valid_from IS NULL OR n.valid_from <= $now)
-          AND (n.valid_to   IS NULL OR n.valid_to   >= $now)
-        OPTIONAL MATCH (n)-[:MENTIONS]->(entity:Entity)
-        OPTIONAL MATCH (mem:Memory)-[:ABOUT]->(entity)
-            WHERE ($agent_id = '' OR mem.agent_id = $agent_id)
-              AND mem.confidence >= $min_conf
-              AND (mem.valid_from IS NULL OR mem.valid_from <= $now)
-              AND (mem.valid_to   IS NULL OR mem.valid_to   >= $now)
-        OPTIONAL MATCH (bel:Belief)-[:ABOUT]->(entity)
-            WHERE ($agent_id = '' OR bel.agent_id = $agent_id)
-              AND bel.confidence >= $min_conf
-              AND (bel.valid_from IS NULL OR bel.valid_from <= $now)
-              AND (bel.valid_to   IS NULL OR bel.valid_to   >= $now)
-        OPTIONAL MATCH (evt:Event)-[:INVOLVES]->(entity)
-                OPTIONAL MATCH (doc:Document)-[doc_rel]->(n)
-                    WHERE type(doc_rel) IN ['HAS_CHUNK', 'CONTAINS']
-        WITH
-            n,
-            doc,
-            collect(DISTINCT properties(entity))[..5] AS concepts,
-            collect(DISTINCT properties(mem))[..5]     AS memories,
-            collect(DISTINCT properties(bel))[..3]     AS beliefs,
-            collect(DISTINCT properties(evt))[..5]     AS events,
-            max(evt.timestamp) AS latest_event_ts
-        RETURN
-            properties(n)   AS node, labels(n) AS labels,
-            properties(doc) AS document,
-            concepts,
-            memories,
-            beliefs,
-            events,
-            latest_event_ts
-        ORDER BY latest_event_ts DESC
-        LIMIT 20
-    """,
-    "semantic": """
-        MATCH (n) WHERE elementId(n) IN $ids
-          AND (n.valid_from IS NULL OR n.valid_from <= $now)
-          AND (n.valid_to   IS NULL OR n.valid_to   >= $now)
-        OPTIONAL MATCH (n)-[:MENTIONS]->(entity:Entity)
-        OPTIONAL MATCH (n)-[:NEXT]-(neighbor:Chunk)
-          WHERE (neighbor.valid_to IS NULL OR neighbor.valid_to >= $now)
-                OPTIONAL MATCH (doc:Document)-[doc_rel]->(n)
-                    WHERE type(doc_rel) IN ['HAS_CHUNK', 'CONTAINS']
-        RETURN
-            properties(n)   AS node, labels(n) AS labels,
-            properties(doc) AS document,
-            collect(DISTINCT properties(entity))[..5]  AS concepts,
-            collect(DISTINCT properties(neighbor))[..3] AS neighbors
-        LIMIT 20
-    """,
-    "inference": """
-        MATCH (n) WHERE elementId(n) IN $ids
-          AND (n.valid_from IS NULL OR n.valid_from <= $now)
-          AND (n.valid_to   IS NULL OR n.valid_to   >= $now)
-        OPTIONAL MATCH (n)-[:DERIVED_FROM]->(src)
-        OPTIONAL MATCH (n)-[:SUPPORTS]->(tgt)
-                OPTIONAL MATCH (doc:Document)-[doc_rel]->(n)
-                    WHERE type(doc_rel) IN ['HAS_CHUNK', 'CONTAINS']
-        OPTIONAL MATCH (downstream:Inference)-[:DERIVED_FROM]->(n)
-            WHERE downstream.confidence >= $min_conf
-              AND ($agent_id = '' OR downstream.agent_id = $agent_id)
-              AND (downstream.valid_from IS NULL OR downstream.valid_from <= $now)
-              AND (downstream.valid_to   IS NULL OR downstream.valid_to   >= $now)
-        RETURN
-            properties(n)   AS node, labels(n) AS labels,
-            properties(doc) AS document,
-            collect(DISTINCT properties(src))[..5]        AS sources,
-            collect(DISTINCT properties(tgt))[..5]        AS supports,
-            collect(DISTINCT properties(downstream))[..3] AS downstream_inferences
-        LIMIT 20
-    """,
-    "belief": """
-        MATCH (n) WHERE elementId(n) IN $ids
-          AND (n.valid_from IS NULL OR n.valid_from <= $now)
-          AND (n.valid_to   IS NULL OR n.valid_to   >= $now)
-        OPTIONAL MATCH (a:Agent)-[:HOLDS]->(n)
-        OPTIONAL MATCH (n)-[:ABOUT]->(entity:Entity)
-        OPTIONAL MATCH (n)-[:CONTRADICTS]-(other:Belief)
-            WHERE other.confidence >= $min_conf
-              AND (other.valid_to IS NULL OR other.valid_to >= $now)
-        OPTIONAL MATCH (infer_node:Inference)-[:SUPPORTS]->(n)
-            WHERE infer_node.confidence >= $min_conf
-              AND (infer_node.valid_from IS NULL OR infer_node.valid_from <= $now)
-              AND (infer_node.valid_to   IS NULL OR infer_node.valid_to   >= $now)
-        RETURN
-            properties(n)   AS node, labels(n) AS labels, null AS document,
-            properties(a)   AS agent,
-            collect(DISTINCT properties(entity))[..5]       AS concepts,
-            collect(DISTINCT properties(other))[..3]         AS contradictions,
-            collect(DISTINCT properties(infer_node))[..3]    AS supporting_inferences
-        LIMIT 20
-    """,
-}
-
-_FALLBACK_CYPHER = """
-    MATCH (n)
-    WHERE any(k IN keys(n) WHERE NOT valueType(n[k]) STARTS WITH 'LIST' AND toLower(toString(n[k])) CONTAINS toLower($q))
-      AND coalesce(n.confidence, 1.0) >= $min_conf
-      AND (n.valid_from IS NULL OR n.valid_from <= $now)
-      AND (n.valid_to   IS NULL OR n.valid_to   >= $now)
-    RETURN properties(n) AS node, labels(n) AS labels, null AS document
-    LIMIT 10
-"""
-
-
-async def neo4j_expand(
-    element_ids: list,
-    intent: str,
-    query: str,
-) -> list:
-    """Expand the graph around Qdrant candidate nodes based on intent."""
-    cypher = _EXPAND_CYPHER.get(intent, _EXPAND_CYPHER["semantic"])
-    now = _now_iso()
-    params = {
-        "ids":      element_ids,
-        "agent_id": AGENT_ID,
-        "min_conf": CONFIDENCE_THRESHOLD,
-        "now":      now,
-    }
-
-    if not element_ids:
-        cypher = _FALLBACK_CYPHER
-        params  = {"q": query[:100], "min_conf": CONFIDENCE_THRESHOLD, "now": now}
-
-    try:
-        driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-        try:
-            async with driver.session(database=NEO4J_DATABASE) as session:
-                result = await session.run(cypher, params)
-                return await result.data()
-        finally:
-            await driver.close()
-    except Exception as exc:
-        logger.warning("Neo4j expansion failed: %s", exc)
-        return []
-
-
-# ── Step 2c: Retrieval Provenance Chain ───────────────────────────────────────
-
-async def build_provenance_chain(element_ids: list) -> str:
-    """
-    Trace the retrieval path: Chunk → Concept/Entity/Inference in Neo4j.
-    Returns a human-readable provenance string, or "" if nothing found.
-    """
-    if not element_ids:
-        return ""
-    try:
-        driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-        try:
-            async with driver.session(database=NEO4J_DATABASE) as session:
-                result = await session.run(
-                    """
-                    MATCH path = (c:Chunk)-[:MENTIONS*0..2]->(n)
-                    WHERE elementId(c) IN $ids
-                    RETURN [node IN nodes(path) |
-                        labels(node)[0] + ': ' +
-                        coalesce(node.text, node.name, node.title, '?')
-                    ] AS chain
-                    LIMIT 5
-                    """,
-                    ids=element_ids,
-                )
-                rows = await result.data()
-        finally:
-            await driver.close()
-        if not rows:
-            return ""
-        chains = [" → ".join(r["chain"][:80] if isinstance(r["chain"], list) else [str(r["chain"])]) for r in rows[:3]]
-        return " | ".join(c for c in chains if c)
-    except Exception as exc:
-        logger.debug("Provenance chain query failed: %s", exc)
-        return ""
+# ── Step 2b/2c: structural expansion + provenance chain ──────────────────────
+# The Neo4j-based graph expansion (_EXPAND_CYPHER/neo4j_expand) and provenance
+# chain (build_provenance_chain) that used to run here were removed with the
+# Graphiti/FalkorDB cutover — see docs/adr/0001-graphiti-falkordb-backend.md.
+# graphiti_search() above already returns hybrid semantic + graph + temporal
+# results in one call, and _run_chat_completion() builds its provenance string
+# directly from each hit's document_id, so neither helper had a live caller.
 
 
 # ── Step 3: Reflection ─────────────────────────────────────────────────────────
@@ -1012,7 +675,7 @@ def _reflection_fallback(qdrant_hits: list, graph_records: list) -> list:
     if graph_records:
         return graph_records
     if qdrant_hits:
-        logger.info("Reflection: Neo4j empty, falling back to Qdrant chunk text.")
+        logger.info("Reflection: no graph records, falling back to Graphiti fact text.")
         return [
             {
                 "node": {
@@ -2046,82 +1709,6 @@ async def knowledge_ui():
         return f.read()
 
 
-async def _qdrant_collection_doc_ids(collection: str, limit: int | None = None) -> list[str]:
-    doc_ids: list[str] = []
-    seen: set[str] = set()
-    offset = None
-
-    async with httpx.AsyncClient(timeout=30) as c:
-        while True:
-            body: dict = {
-                "limit": 100,
-                "with_payload": ["document_id"],
-                "with_vector": False,
-            }
-            if offset is not None:
-                body["offset"] = offset
-
-            resp = await c.post(f"{QDRANT_URL}/collections/{collection}/points/scroll", json=body)
-            if resp.status_code == 404:
-                raise HTTPException(status_code=404, detail=f"Collection '{collection}' not found")
-            resp.raise_for_status()
-
-            result = resp.json().get("result", {})
-            points = result.get("points", [])
-            for point in points:
-                payload = point.get("payload") or {}
-                doc_id = payload.get("document_id")
-                if doc_id and doc_id not in seen:
-                    seen.add(doc_id)
-                    doc_ids.append(doc_id)
-                    if limit and len(doc_ids) >= limit:
-                        return doc_ids
-
-            offset = result.get("next_page_offset")
-            if offset is None:
-                break
-
-    return doc_ids
-
-
-async def _neo4j_fetch_documents(doc_ids: list[str], limit: int | None = None) -> list[dict]:
-    if not doc_ids:
-        return []
-
-    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-    try:
-        async with driver.session(database=NEO4J_DATABASE) as s:
-            query = (
-                "UNWIND $doc_ids AS did "
-                "MATCH (d:Document {document_id: did}) "
-                "OPTIONAL MATCH (d)-[chunk_rel]->(c:Chunk) "
-                "WHERE type(chunk_rel) IN ['HAS_CHUNK', 'CONTAINS'] "
-                "RETURN d.document_id AS doc_id, d.title AS title, "
-                "       d.created_at AS created_at, d.access_level AS access_level, "
-                "       count(c) AS chunk_count "
-                "ORDER BY d.created_at DESC"
-            )
-            if limit:
-                query += " LIMIT $limit"
-                result = await s.run(query, doc_ids=doc_ids, limit=limit)
-            else:
-                result = await s.run(query, doc_ids=doc_ids)
-            records = await result.data()
-    finally:
-        await driver.close()
-
-    return [
-        {
-            "doc_id": r["doc_id"],
-            "title": r["title"] or r["doc_id"],
-            "created_at": r["created_at"],
-            "access_level": r["access_level"],
-            "chunk_count": r["chunk_count"],
-        }
-        for r in records
-    ]
-
-
 @app.get("/api/buckets")
 async def api_buckets():
     """List MinIO buckets, so the ingest UI can offer a picker alongside a
@@ -2146,7 +1733,9 @@ async def api_buckets():
 @app.get("/api/collections")
 async def api_collections():
     """List configured Graphiti group namespaces and recent episodes."""
-    names = list(dict.fromkeys([GRAPHITI_GROUP_ID, *RAG_EXTRA_COLLECTIONS]))
+    names = list(dict.fromkeys(
+        [GRAPHITI_GROUP_ID, *RAG_EXTRA_COLLECTIONS, GRAPHITI_CHAT_SESSIONS_GROUP_ID]
+    ))
     collections = []
     async with httpx.AsyncClient(timeout=30) as client:
         for name in names:
@@ -2177,60 +1766,6 @@ async def api_collections():
             })
     return {"collections": collections, "embedding_model": os.getenv("GRAPHITI_EMBEDDING_MODEL", OLLAMA_EMBEDDING_MODEL)}
 
-    # Legacy Qdrant/Neo4j implementation retained below temporarily for API
-    # history; it is unreachable after the Graphiti return above.
-    collections = []
-    try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            resp = await c.get(f"{QDRANT_URL}/collections")
-            resp.raise_for_status()
-            for col in resp.json().get("result", {}).get("collections", []):
-                name = col["name"]
-                info_resp = await c.get(f"{QDRANT_URL}/collections/{name}")
-                info = info_resp.json().get("result", {})
-                collections.append({
-                    "name":            name,
-                    "points_count":    info.get("points_count", 0),
-                    "doc_count":       0,
-                    "recent_docs":     [],
-                    "embedding_model": EMBEDDING_MODEL,
-                })
-    except Exception as exc:
-        logger.warning("Qdrant collection fetch failed: %s", exc)
-
-    # If the configured collection is missing from Qdrant, still show it
-    names = {c["name"] for c in collections}
-    if QDRANT_COLLECTION not in names:
-        collections.insert(0, {
-            "name":            QDRANT_COLLECTION,
-            "points_count":    0,
-            "doc_count":       0,
-            "recent_docs":     [],
-            "embedding_model": EMBEDDING_MODEL,
-        })
-
-    for col in collections:
-        try:
-            doc_ids = await _qdrant_collection_doc_ids(col["name"])
-            docs = await _neo4j_fetch_documents(doc_ids, limit=5)
-            col["doc_count"] = len(doc_ids)
-            col["recent_docs"] = [
-                {
-                    "doc_id": doc["doc_id"],
-                    "title": doc["title"],
-                    "created_at": doc["created_at"],
-                    "access_level": doc["access_level"],
-                }
-                for doc in docs
-            ]
-        except HTTPException as exc:
-            if exc.status_code != 404:
-                raise
-        except Exception as exc:
-            logger.warning("Collection doc metadata failed for '%s': %s", col["name"], exc)
-
-    return {"collections": collections, "embedding_model": EMBEDDING_MODEL}
-
 
 @app.get("/api/collections/{name}/docs")
 async def api_collection_docs(name: str):
@@ -2257,250 +1792,20 @@ async def api_collection_docs(name: str):
         raise HTTPException(status_code=502, detail=str(exc))
 
 
-_DOC_ARCHIVE_COLLECTION = "_doc_archive"
-
-
 @app.delete("/api/collections/{name}/docs/{doc_id}")
 async def api_archive_document(name: str, doc_id: str):
-    """Delete one Graphiti episode. Source files remain preserved in MinIO."""
+    """Delete one Graphiti episode. Source files remain preserved in MinIO.
+
+    This is a permanent deletion from the knowledge graph — Graphiti has no
+    archive/restore concept (see docs/adr/0001-graphiti-falkordb-backend.md).
+    To bring a document back, re-ingest its original from MinIO.
+    """
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.delete(f"{GRAPHITI_URL}/episode/{doc_id}")
         if response.status_code == 404:
             raise HTTPException(status_code=404, detail=f"Episode '{doc_id}' not found")
         response.raise_for_status()
     return {"status": "deleted", "doc_id": doc_id, "collection": name}
-
-    # Legacy archive implementation retained below for API history.
-    now = _now_iso()
-    points: list = []
-
-    async with httpx.AsyncClient(timeout=60) as c:
-        chk = await c.get(f"{QDRANT_URL}/collections/{name}")
-        if chk.status_code == 404:
-            raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
-
-        vec_params = (chk.json().get("result", {})
-                      .get("config", {}).get("params", {}).get("vectors", {}))
-        vec_size = vec_params.get("size") if isinstance(vec_params, dict) else None
-        vec_size = vec_size or await _get_embed_dim()
-        distance = vec_params.get("distance", "Cosine") if isinstance(vec_params, dict) else "Cosine"
-
-        # Ensure archive collection exists
-        arc_chk = await c.get(f"{QDRANT_URL}/collections/{_DOC_ARCHIVE_COLLECTION}")
-        if arc_chk.status_code == 404:
-            cr = await c.put(
-                f"{QDRANT_URL}/collections/{_DOC_ARCHIVE_COLLECTION}",
-                json={"vectors": {"size": vec_size, "distance": distance}},
-            )
-            cr.raise_for_status()
-
-        # Scroll all points for this document
-        offset = None
-        while True:
-            scroll_body: dict = {
-                "limit": 100, "with_payload": True, "with_vector": True,
-                "filter": {"must": [{"key": "document_id", "match": {"value": doc_id}}]},
-            }
-            if offset is not None:
-                scroll_body["offset"] = offset
-            sr = await c.post(f"{QDRANT_URL}/collections/{name}/points/scroll", json=scroll_body)
-            sr.raise_for_status()
-            result = sr.json().get("result", {})
-            pts = result.get("points", [])
-            points.extend(pts)
-            offset = result.get("next_page_offset")
-            if offset is None:
-                break
-
-        if not points:
-            raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found in '{name}'")
-
-        # Stamp archive metadata into each point's payload
-        for p in points:
-            if p.get("payload") is None:
-                p["payload"] = {}
-            p["payload"]["_archived_from_collection"] = name
-            p["payload"]["_archived_at"] = now
-
-        # Copy to _doc_archive
-        ur = await c.put(
-            f"{QDRANT_URL}/collections/{_DOC_ARCHIVE_COLLECTION}/points",
-            params={"wait": "true"}, json={"points": points},
-        )
-        ur.raise_for_status()
-
-        # Remove from source collection
-        dr = await c.post(
-            f"{QDRANT_URL}/collections/{name}/points/delete",
-            params={"wait": "true"},
-            json={"filter": {"must": [{"key": "document_id", "match": {"value": doc_id}}]}},
-        )
-        dr.raise_for_status()
-
-    # Neo4j: mark Document as archived and record ArchivedDocument node
-    title = doc_id
-    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-    try:
-        async with driver.session(database=NEO4J_DATABASE) as s:
-            res = await s.run(
-                "MATCH (d:Document {document_id: $did}) "
-                "SET d.archived = true, d.archived_at = $now, d.archived_from = $col "
-                "RETURN d.title AS title",
-                did=doc_id, now=now, col=name,
-            )
-            rec = await res.single()
-            if rec and rec["title"]:
-                title = rec["title"]
-            await s.run(
-                "MERGE (a:ArchivedDocument {document_id: $did}) "
-                "SET a.title = $title, a.source_collection = $col, "
-                "    a.archived_at = $now, a.chunk_count = $cc",
-                did=doc_id, title=title, col=name, now=now, cc=len(points),
-            )
-    except Exception as exc:
-        logger.warning("Neo4j archive doc metadata failed: %s", exc)
-    finally:
-        await driver.close()
-
-    return {
-        "status":            "archived",
-        "doc_id":            doc_id,
-        "title":             title,
-        "source_collection": name,
-        "chunks_archived":   len(points),
-    }
-
-
-@app.get("/api/doc-archives")
-async def api_list_doc_archives():
-    """List all individually archived documents."""
-    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-    try:
-        async with driver.session(database=NEO4J_DATABASE) as s:
-            result = await s.run(
-                "MATCH (a:ArchivedDocument) "
-                "RETURN a.document_id AS doc_id, a.title AS title, "
-                "       a.source_collection AS source_collection, "
-                "       a.archived_at AS archived_at, a.chunk_count AS chunk_count "
-                "ORDER BY a.archived_at DESC"
-            )
-            records = await result.data()
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
-    finally:
-        await driver.close()
-    return {"doc_archives": [dict(r) for r in records]}
-
-
-@app.post("/api/doc-archives/{doc_id}/restore")
-async def api_restore_doc_archive(doc_id: str, request: Request):
-    """Restore an archived document back into its original (or specified) collection."""
-    body = await request.json()
-    target_collection = (body.get("collection") or "").strip()
-
-    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-    try:
-        async with driver.session(database=NEO4J_DATABASE) as s:
-            res = await s.run(
-                "MATCH (a:ArchivedDocument {document_id: $did}) "
-                "RETURN a.source_collection AS source_collection",
-                did=doc_id,
-            )
-            rec = await res.single()
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
-    finally:
-        await driver.close()
-
-    if not rec:
-        raise HTTPException(status_code=404, detail=f"Archived document '{doc_id}' not found")
-
-    restore_to = target_collection or rec["source_collection"]
-    points: list = []
-
-    async with httpx.AsyncClient(timeout=60) as c:
-        arc_chk = await c.get(f"{QDRANT_URL}/collections/{_DOC_ARCHIVE_COLLECTION}")
-        if arc_chk.status_code == 404:
-            raise HTTPException(status_code=404, detail="Document archive not found in Qdrant")
-
-        # Ensure target collection exists
-        tgt_chk = await c.get(f"{QDRANT_URL}/collections/{restore_to}")
-        if tgt_chk.status_code == 404:
-            vec_params = (arc_chk.json().get("result", {})
-                          .get("config", {}).get("params", {}).get("vectors", {}))
-            vec_size = vec_params.get("size") if isinstance(vec_params, dict) else None
-            vec_size = vec_size or await _get_embed_dim()
-            distance = vec_params.get("distance", "Cosine") if isinstance(vec_params, dict) else "Cosine"
-            cr = await c.put(
-                f"{QDRANT_URL}/collections/{restore_to}",
-                json={"vectors": {"size": vec_size, "distance": distance}},
-            )
-            cr.raise_for_status()
-
-        # Scroll archived points for this document
-        offset = None
-        while True:
-            scroll_body: dict = {
-                "limit": 100, "with_payload": True, "with_vector": True,
-                "filter": {"must": [{"key": "document_id", "match": {"value": doc_id}}]},
-            }
-            if offset is not None:
-                scroll_body["offset"] = offset
-            sr = await c.post(
-                f"{QDRANT_URL}/collections/{_DOC_ARCHIVE_COLLECTION}/points/scroll",
-                json=scroll_body,
-            )
-            sr.raise_for_status()
-            result = sr.json().get("result", {})
-            pts = result.get("points", [])
-            points.extend(pts)
-            offset = result.get("next_page_offset")
-            if offset is None:
-                break
-
-        if not points:
-            raise HTTPException(status_code=404, detail=f"No archived vectors found for '{doc_id}'")
-
-        # Strip archive metadata before restoring
-        for p in points:
-            if p.get("payload"):
-                p["payload"].pop("_archived_from_collection", None)
-                p["payload"].pop("_archived_at", None)
-
-        # Copy to target collection
-        ur = await c.put(
-            f"{QDRANT_URL}/collections/{restore_to}/points",
-            params={"wait": "true"}, json={"points": points},
-        )
-        ur.raise_for_status()
-
-        # Delete from archive
-        dr = await c.post(
-            f"{QDRANT_URL}/collections/{_DOC_ARCHIVE_COLLECTION}/points/delete",
-            params={"wait": "true"},
-            json={"filter": {"must": [{"key": "document_id", "match": {"value": doc_id}}]}},
-        )
-        dr.raise_for_status()
-
-    # Neo4j cleanup
-    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-    try:
-        async with driver.session(database=NEO4J_DATABASE) as s:
-            await s.run(
-                "MATCH (d:Document {document_id: $did}) "
-                "REMOVE d.archived REMOVE d.archived_at REMOVE d.archived_from",
-                did=doc_id,
-            )
-            await s.run(
-                "MATCH (a:ArchivedDocument {document_id: $did}) DETACH DELETE a",
-                did=doc_id,
-            )
-    except Exception as exc:
-        logger.warning("Neo4j restore doc cleanup failed: %s", exc)
-    finally:
-        await driver.close()
-
-    return {"status": "restored", "doc_id": doc_id, "collection": restore_to, "points_restored": len(points)}
 
 
 @app.post("/api/collections")
@@ -2512,21 +1817,6 @@ async def api_create_collection(request: Request):
         raise HTTPException(status_code=400, detail="Invalid collection name")
     METRIC_COLLECTION_OPS.labels(operation="create").inc()
     return {"status": "ok", "name": name, "materializes_on_first_ingest": True}
-
-    # Legacy implementation retained below for API history.
-    vec_size = int(body.get("vector_size", 0)) or await _get_embed_dim()
-    distance = body.get("distance", "Cosine")
-    async with httpx.AsyncClient(timeout=30) as c:
-        chk = await c.get(f"{QDRANT_URL}/collections/{name}")
-        if chk.status_code == 200:
-            raise HTTPException(status_code=409, detail=f"Collection '{name}' already exists")
-        resp = await c.put(
-            f"{QDRANT_URL}/collections/{name}",
-            json={"vectors": {"size": vec_size, "distance": distance}},
-        )
-        resp.raise_for_status()
-    METRIC_COLLECTION_OPS.labels(operation="create").inc()
-    return {"status": "ok", "name": name}
 
 
 @app.patch("/api/collections/{name}")
@@ -2541,63 +1831,15 @@ async def api_rename_collection(name: str, request: Request):
         detail="Graphiti group IDs are immutable; ingest into the new group, verify it, then delete the old group.",
     )
 
-    # Legacy implementation retained below for API history.
-    if new_name == name:
-        return {"status": "ok", "name": new_name, "points_copied": 0}
-
-    async with httpx.AsyncClient(timeout=120) as c:
-        info_resp = await c.get(f"{QDRANT_URL}/collections/{name}")
-        if info_resp.status_code == 404:
-            raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
-        vec_params = (info_resp.json().get("result", {})
-                      .get("config", {}).get("params", {}).get("vectors", {}))
-        vec_size = vec_params.get("size") if isinstance(vec_params, dict) else None
-        vec_size = vec_size or await _get_embed_dim()
-        distance = vec_params.get("distance", "Cosine") if isinstance(vec_params, dict) else "Cosine"
-
-        chk = await c.get(f"{QDRANT_URL}/collections/{new_name}")
-        if chk.status_code == 200:
-            raise HTTPException(status_code=409, detail=f"Collection '{new_name}' already exists")
-
-        cr = await c.put(
-            f"{QDRANT_URL}/collections/{new_name}",
-            json={"vectors": {"size": vec_size, "distance": distance}},
-        )
-        cr.raise_for_status()
-
-        offset = None
-        total = 0
-        while True:
-            scroll_body: dict = {"limit": 100, "with_payload": True, "with_vector": True}
-            if offset is not None:
-                scroll_body["offset"] = offset
-            sr = await c.post(
-                f"{QDRANT_URL}/collections/{name}/points/scroll", json=scroll_body
-            )
-            sr.raise_for_status()
-            result = sr.json().get("result", {})
-            pts = result.get("points", [])
-            if pts:
-                ur = await c.put(
-                    f"{QDRANT_URL}/collections/{new_name}/points",
-                    params={"wait": "true"},
-                    json={"points": pts},
-                )
-                ur.raise_for_status()
-                total += len(pts)
-            offset = result.get("next_page_offset")
-            if offset is None:
-                break
-
-        await c.delete(f"{QDRANT_URL}/collections/{name}")
-
-    METRIC_COLLECTION_OPS.labels(operation="rename").inc()
-    return {"status": "ok", "name": new_name, "points_copied": total}
-
 
 @app.delete("/api/collections/{name}")
 async def api_archive_collection(name: str):
-    """Delete a Graphiti group after its source objects have been retained in MinIO."""
+    """Delete a Graphiti group after its source objects have been retained in MinIO.
+
+    This is a permanent deletion — Graphiti has no archive/restore concept
+    (see docs/adr/0001-graphiti-falkordb-backend.md). To bring a group back,
+    re-ingest its source documents from MinIO into a new group.
+    """
     if name == GRAPHITI_GROUP_ID:
         raise HTTPException(status_code=409, detail="The default Graphiti group cannot be deleted")
     async with httpx.AsyncClient(timeout=60) as client:
@@ -2605,221 +1847,6 @@ async def api_archive_collection(name: str):
         response.raise_for_status()
     METRIC_COLLECTION_OPS.labels(operation="delete").inc()
     return {"status": "deleted", "name": name}
-
-    # Legacy implementation retained below for API history.
-    ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    archive_qname = f"_archived_{name}_{ts_ms}"
-    now = _now_iso()
-    doc_ids: set = set()
-    points_count = 0
-
-    async with httpx.AsyncClient(timeout=120) as c:
-        info_resp = await c.get(f"{QDRANT_URL}/collections/{name}")
-        if info_resp.status_code == 404:
-            raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
-        vec_params = (info_resp.json().get("result", {})
-                      .get("config", {}).get("params", {}).get("vectors", {}))
-        vec_size = vec_params.get("size") if isinstance(vec_params, dict) else None
-        vec_size = vec_size or await _get_embed_dim()
-        distance = vec_params.get("distance", "Cosine") if isinstance(vec_params, dict) else "Cosine"
-
-        cr = await c.put(
-            f"{QDRANT_URL}/collections/{archive_qname}",
-            json={"vectors": {"size": vec_size, "distance": distance}},
-        )
-        cr.raise_for_status()
-
-        offset = None
-        while True:
-            scroll_body: dict = {"limit": 100, "with_payload": True, "with_vector": True}
-            if offset is not None:
-                scroll_body["offset"] = offset
-            sr = await c.post(
-                f"{QDRANT_URL}/collections/{name}/points/scroll", json=scroll_body
-            )
-            sr.raise_for_status()
-            result = sr.json().get("result", {})
-            pts = result.get("points", [])
-            if pts:
-                for p in pts:
-                    did = (p.get("payload") or {}).get("document_id")
-                    if did:
-                        doc_ids.add(did)
-                ur = await c.put(
-                    f"{QDRANT_URL}/collections/{archive_qname}/points",
-                    params={"wait": "true"}, json={"points": pts},
-                )
-                ur.raise_for_status()
-                points_count += len(pts)
-            offset = result.get("next_page_offset")
-            if offset is None:
-                break
-
-        await c.delete(f"{QDRANT_URL}/collections/{name}")
-
-    doc_ids_list = list(doc_ids)
-    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-    try:
-        async with driver.session(database=NEO4J_DATABASE) as s:
-            if doc_ids_list:
-                await s.run(
-                    "UNWIND $ids AS did "
-                    "MATCH (d:Document {document_id: did}) "
-                    "SET d.archived = true, d.archived_at = $now, d.archived_from = $orig",
-                    ids=doc_ids_list, now=now, orig=name,
-                )
-            await s.run(
-                "CREATE (:ArchivedCollection {"
-                "  qdrant_name: $qname, original_name: $oname,"
-                "  archived_at: $now, doc_ids: $doc_ids, points_count: $pc"
-                "})",
-                qname=archive_qname, oname=name, now=now,
-                doc_ids=doc_ids_list, pc=points_count,
-            )
-    except Exception as exc:
-        logger.warning("Neo4j archive metadata failed: %s", exc)
-    finally:
-        await driver.close()
-
-    METRIC_COLLECTION_OPS.labels(operation="archive").inc()
-    return {
-        "status":        "archived",
-        "archive_name":  archive_qname,
-        "original_name": name,
-        "points":        points_count,
-        "documents":     len(doc_ids_list),
-    }
-
-
-@app.get("/api/archives")
-async def api_list_archives():
-    """List all archived collections recorded in Neo4j."""
-    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-    try:
-        async with driver.session(database=NEO4J_DATABASE) as s:
-            result = await s.run(
-                "MATCH (a:ArchivedCollection) "
-                "RETURN a.qdrant_name AS qdrant_name, a.original_name AS original_name, "
-                "       a.archived_at AS archived_at, a.doc_ids AS doc_ids, "
-                "       a.points_count AS points_count "
-                "ORDER BY a.archived_at DESC"
-            )
-            records = await result.data()
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
-    finally:
-        await driver.close()
-
-    archives = []
-    async with httpx.AsyncClient(timeout=10) as c:
-        for r in records:
-            chk = await c.get(f"{QDRANT_URL}/collections/{r['qdrant_name']}")
-            archives.append({
-                "qdrant_name":   r["qdrant_name"],
-                "original_name": r["original_name"],
-                "archived_at":   r["archived_at"],
-                "points_count":  r["points_count"] or 0,
-                "doc_count":     len(r["doc_ids"] or []),
-                "qdrant_exists": chk.status_code == 200,
-            })
-    return {"archives": archives}
-
-
-@app.post("/api/archives/{archive_name}/restore")
-async def api_restore_archive(archive_name: str, request: Request):
-    """Restore an archived collection to active, with optional rename."""
-    body = await request.json()
-    restore_name = (body.get("name") or "").strip()
-
-    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-    try:
-        async with driver.session(database=NEO4J_DATABASE) as s:
-            res = await s.run(
-                "MATCH (a:ArchivedCollection {qdrant_name: $qname}) "
-                "RETURN a.original_name AS original_name, a.doc_ids AS doc_ids",
-                qname=archive_name,
-            )
-            rec = await res.single()
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
-    finally:
-        await driver.close()
-
-    if not rec:
-        raise HTTPException(status_code=404, detail=f"Archive '{archive_name}' not found")
-
-    original_name = rec["original_name"]
-    doc_ids = list(rec["doc_ids"] or [])
-    target_name = restore_name or original_name
-
-    async with httpx.AsyncClient(timeout=120) as c:
-        info_resp = await c.get(f"{QDRANT_URL}/collections/{archive_name}")
-        if info_resp.status_code == 404:
-            raise HTTPException(status_code=404, detail=f"Qdrant archive '{archive_name}' not found")
-        vec_params = (info_resp.json().get("result", {})
-                      .get("config", {}).get("params", {}).get("vectors", {}))
-        vec_size = vec_params.get("size") if isinstance(vec_params, dict) else None
-        vec_size = vec_size or await _get_embed_dim()
-        distance = vec_params.get("distance", "Cosine") if isinstance(vec_params, dict) else "Cosine"
-
-        chk = await c.get(f"{QDRANT_URL}/collections/{target_name}")
-        if chk.status_code == 200:
-            raise HTTPException(
-                status_code=409, detail=f"Collection '{target_name}' already exists"
-            )
-
-        cr = await c.put(
-            f"{QDRANT_URL}/collections/{target_name}",
-            json={"vectors": {"size": vec_size, "distance": distance}},
-        )
-        cr.raise_for_status()
-
-        offset = None
-        total = 0
-        while True:
-            scroll_body: dict = {"limit": 100, "with_payload": True, "with_vector": True}
-            if offset is not None:
-                scroll_body["offset"] = offset
-            sr = await c.post(
-                f"{QDRANT_URL}/collections/{archive_name}/points/scroll", json=scroll_body
-            )
-            sr.raise_for_status()
-            result = sr.json().get("result", {})
-            pts = result.get("points", [])
-            if pts:
-                ur = await c.put(
-                    f"{QDRANT_URL}/collections/{target_name}/points",
-                    params={"wait": "true"}, json={"points": pts},
-                )
-                ur.raise_for_status()
-                total += len(pts)
-            offset = result.get("next_page_offset")
-            if offset is None:
-                break
-
-        await c.delete(f"{QDRANT_URL}/collections/{archive_name}")
-
-    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-    try:
-        async with driver.session(database=NEO4J_DATABASE) as s:
-            if doc_ids:
-                await s.run(
-                    "UNWIND $ids AS did "
-                    "MATCH (d:Document {document_id: did}) "
-                    "REMOVE d.archived REMOVE d.archived_at REMOVE d.archived_from",
-                    ids=doc_ids,
-                )
-            await s.run(
-                "MATCH (a:ArchivedCollection {qdrant_name: $qname}) DETACH DELETE a",
-                qname=archive_name,
-            )
-    except Exception as exc:
-        logger.warning("Neo4j restore cleanup failed: %s", exc)
-    finally:
-        await driver.close()
-
-    METRIC_COLLECTION_OPS.labels(operation="restore").inc()
-    return {"status": "restored", "name": target_name, "points_restored": total}
 
 
 @app.get("/api/search")
@@ -2861,7 +1888,7 @@ async def _ingest_bytes(
     valid_hours: float = 0.0,
 ) -> dict:
     """Core ingest pipeline shared by every entry point: extract -> chunk ->
-    Neo4j -> Qdrant, plus a best-effort original-file copy to MinIO.
+    Graphiti (FalkorDB), plus a best-effort original-file copy to MinIO.
     Raises HTTPException on failure."""
     if not data:
         raise HTTPException(status_code=400, detail="Empty file")
@@ -2904,8 +1931,6 @@ async def _ingest_bytes(
                     "organizations": result.entities.organizations[:5],
                 },
             }
-            # Store tables as separate Neo4j nodes (linked after main ingest)
-            _docint_tables_pending[doc_id] = result.tables
         else:
             text = _extract_text(filename, data).strip()
     except Exception as exc:
@@ -2943,7 +1968,6 @@ async def _ingest_bytes(
 
     # Graphiti extracts entities, relationships, provenance, and temporal facts
     # asynchronously from each episode; no separate NER/graph backfill is needed.
-    _docint_tables_pending.pop(doc_id, None)
 
     METRIC_INGEST_TOTAL.labels(status="success").inc()
     METRIC_INGEST_CHUNKS.observe(len(chunks))
@@ -2986,286 +2010,194 @@ async def api_ingest(
     )
 
 
-# In-memory staging for DocTable nodes created during /api/ingest
-_docint_tables_pending: dict[str, list] = {}
+# ── Chat session ingest ─────────────────────────────────────────────────────────
+# Archives full chat-session transcripts to MinIO (S3) and indexes them into
+# Graphiti, so conversation history is retrievable the same way documents are —
+# not just files uploaded during a session. Called by the
+# gcor_chat_session_ingest OpenWebUI filter after each assistant turn; see
+# openwebui-functions/gcor_chat_session_ingest.py.
+
+GRAPHITI_CHAT_SESSIONS_GROUP_ID = os.getenv("GRAPHITI_CHAT_SESSIONS_GROUP_ID", "chat_sessions")
+S3_CHAT_SESSIONS_PREFIX         = os.getenv("S3_CHAT_SESSIONS_PREFIX", "chat-sessions/")
+
+_SESSION_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+# OpenWebUI stamps every new chat with one of these placeholder titles before
+# its own async title-generation call replaces them a turn or two later.
+# Treating them as "no real title yet" avoids archiving many unrelated
+# sessions under the same generic name (every fresh chat landing on
+# "new-chat"), and avoids a Graphiti episode literally titled "New Chat".
+_GENERIC_SESSION_TITLES = {"", "new chat", "untitled", "untitled chat", "new conversation"}
 
 
-@app.post("/api/ner-backfill")
-async def ner_backfill(
-    limit: int = Query(500, description="Max chunks to process per call"),
-):
-    """Run NER entity extraction on Chunk nodes that have no MENTIONS edges yet.
+def _slugify(text: str) -> str:
+    """Sanitize free text into an S3-key-safe, still-human-readable slug."""
+    return _SESSION_SLUG_RE.sub("-", (text or "").strip().lower()).strip("-")
 
-    Calls Ollama (OLLAMA_MODEL) per chunk, creates :Entity nodes and MENTIONS
-    relationships.  Safe to call repeatedly — only touches unprocessed chunks.
+
+def _meaningful_session_name(title: str, messages: list, fallback: str) -> str:
+    """Pick a human-readable name for a chat session: the real title if
+    OpenWebUI has generated one yet, else a snippet of the first user
+    message, else the fallback (normally session_id)."""
+    title = (title or "").strip()
+    if title.lower() not in _GENERIC_SESSION_TITLES:
+        return title
+    for m in messages:
+        if not (isinstance(m, dict) and m.get("role") == "user"):
+            continue
+        content = m.get("content")
+        if isinstance(content, list):
+            content = " ".join(
+                part.get("text", "") for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+        content = str(content or "").strip()
+        if content:
+            return content[:60]
+    return fallback or "session"
+
+
+def _render_transcript(messages: list) -> str:
+    """Render chat messages as plain 'role: content' text for chunking/embedding."""
+    lines = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role", "user")).strip() or "user"
+        content = m.get("content")
+        if isinstance(content, list):
+            # OpenAI/OpenWebUI multi-part content (text + image parts, etc.)
+            content = " ".join(
+                part.get("text", "") for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+        content = str(content or "").strip()
+        if content:
+            lines.append(f"{role}: {content}")
+    return "\n\n".join(lines)
+
+
+async def _store_chat_session_to_s3(
+    key: str, payload: dict, bucket: str = S3_BUCKET,
+) -> str | None:
+    """Persist the full chat-session transcript (JSON) to MinIO at the given key.
+
+    Best-effort like _store_original_to_s3 — returns None (never raises) if
+    MinIO is unconfigured or unreachable.
     """
-    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    client = _get_s3_client()
+    if client is None:
+        return None
+    body = json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
     try:
-        async with driver.session(database=NEO4J_DATABASE) as s:
-            result = await s.run(
-                """
-                MATCH (c:Chunk)
-                WHERE NOT (c)-[:MENTIONS]->()
-                  AND c.text IS NOT NULL
-                RETURN elementId(c) AS eid, c.text AS text
-                LIMIT $lim
-                """,
-                lim=limit,
-            )
-            rows = await result.data()
-    finally:
-        await driver.close()
-
-    if not rows:
-        return {"status": "ok", "processed": 0, "mentions_created": 0,
-                "message": "No unprocessed chunks found"}
-
-    chunk_eids  = [r["eid"]  for r in rows]
-    chunk_texts = [r["text"] or "" for r in rows]
-    mentions = await _neo4j_create_mentions(chunk_eids, chunk_texts)
-    return {
-        "status":          "ok",
-        "processed":       len(rows),
-        "mentions_created": mentions,
-    }
-
-
-@app.post("/api/graph-backfill")
-async def graph_backfill():
-    """Backfill NEXT chunk links and CO_OCCURS entity edges for all existing data.
-
-    Safe to call repeatedly — uses MERGE so relationships are idempotent.
-    """
-    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-    try:
-        async with driver.session(database=NEO4J_DATABASE) as s:
-            # 1. Create NEXT links between consecutive chunks within each document
-            next_result = await s.run(
-                """
-                MATCH (d:Document)-[chunk_rel]->(c:Chunk)
-                WHERE type(chunk_rel) IN ['HAS_CHUNK', 'CONTAINS']
-                WITH d, c ORDER BY c.position
-                WITH d, collect(c) AS ordered
-                UNWIND range(0, size(ordered) - 2) AS i
-                WITH ordered[i] AS a, ordered[i + 1] AS b
-                MERGE (a)-[:NEXT]->(b)
-                RETURN count(*) AS next_created
-                """
-            )
-            next_count = (await next_result.single())["next_created"]
-
-            # 2. Create CO_OCCURS edges between entities sharing a chunk
-            cooc_result = await s.run(
-                """
-                MATCH (c:Chunk)-[:MENTIONS]->(e1:Entity)
-                MATCH (c)-[:MENTIONS]->(e2:Entity)
-                WHERE elementId(e1) < elementId(e2)
-                MERGE (e1)-[r:CO_OCCURS]->(e2)
-                  ON CREATE SET r.weight = 1, r.created_at = $now
-                  ON MATCH  SET r.weight = r.weight + 1
-                RETURN count(*) AS cooc_created
-                """,
-                now=_now_iso(),
-            )
-            cooc_count = (await cooc_result.single())["cooc_created"]
-    finally:
-        await driver.close()
-
-    return {
-        "status": "ok",
-        "next_links": next_count,
-        "co_occurs_edges": cooc_count,
-    }
-
-
-@app.post("/api/graph-migrate-chunk-edges")
-async def graph_migrate_chunk_edges(
-    delete_legacy: bool = Query(True, description="Delete legacy CONTAINS edges after migrating to HAS_CHUNK"),
-):
-    """Normalize Document->Chunk relationships from CONTAINS to HAS_CHUNK.
-
-    Safe to call repeatedly. Existing HAS_CHUNK edges are preserved and legacy
-    CONTAINS edges can optionally be deleted after migration.
-    """
-    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-    try:
-        async with driver.session(database=NEO4J_DATABASE) as s:
-            migrate_result = await s.run(
-                """
-                MATCH (d:Document)-[legacy_rel:CONTAINS]->(c:Chunk)
-                MERGE (d)-[:HAS_CHUNK]->(c)
-                RETURN count(legacy_rel) AS legacy_edges_seen
-                """
-            )
-            legacy_edges_seen = (await migrate_result.single())["legacy_edges_seen"]
-
-            deleted_legacy_edges = 0
-            if delete_legacy:
-                delete_result = await s.run(
-                    """
-                    MATCH (:Document)-[legacy_rel:CONTAINS]->(:Chunk)
-                    DELETE legacy_rel
-                    RETURN count(legacy_rel) AS deleted_legacy_edges
-                    """
-                )
-                deleted_legacy_edges = (await delete_result.single())["deleted_legacy_edges"]
-    finally:
-        await driver.close()
-
-    return {
-        "status": "ok",
-        "legacy_edges_seen": legacy_edges_seen,
-        "deleted_legacy_edges": deleted_legacy_edges,
-        "delete_legacy": delete_legacy,
-    }
-
-
-@app.post("/api/buddy-memory-migrate")
-async def buddy_memory_migrate(
-    source: str = Query("buddy_memory", description="Collection to migrate"),
-    batch_size: int = Query(32, description="Re-embedding batch size"),
-):
-    """Migrate a Qdrant collection from 3072-dim (OpenAI large) to 768-dim (nomic-embed-text).
-
-    Steps
-    -----
-    1. Scroll all points from *source* (preserving full payloads + old vectors).
-    2. Back them up as ``{source}_backup_3072`` — old dim intact, safe to restore.
-    3. Re-embed every point's ``text`` payload field via the configured Ollama
-       embedding model (OLLAMA_EMBEDDING_MODEL, typically nomic-embed-text → 768-dim).
-    4. Delete and recreate *source* with the new vector size.
-    5. Upsert all points with new vectors.
-
-    Returns a summary including old/new dimensions and backup collection name.
-    """
-    backup_name = f"{source}_backup_3072"
-
-    # ── 1. Scroll all existing points ─────────────────────────────────────────
-    all_points: list[dict] = []
-    offset = None
-    async with httpx.AsyncClient(timeout=60) as c:
-        while True:
-            body: dict = {"limit": 256, "with_payload": True, "with_vector": True}
-            if offset is not None:
-                body["offset"] = offset
-            resp = await c.post(
-                f"{QDRANT_URL}/collections/{source}/points/scroll",
-                json=body,
-            )
-            if resp.status_code == 404:
-                raise HTTPException(status_code=404, detail=f"Collection '{source}' not found")
-            resp.raise_for_status()
-            data = resp.json()["result"]
-            batch = data.get("points", [])
-            all_points.extend(batch)
-            offset = data.get("next_page_offset")
-            if not offset or not batch:
-                break
-
-    if not all_points:
-        raise HTTPException(status_code=422, detail=f"Collection '{source}' exists but has no points")
-
-    old_dim = len(all_points[0]["vector"])
-
-    # ── 2. Create backup of original vectors ──────────────────────────────────
-    async with httpx.AsyncClient(timeout=60) as c:
-        await c.delete(f"{QDRANT_URL}/collections/{backup_name}")
-        r = await c.put(
-            f"{QDRANT_URL}/collections/{backup_name}",
-            json={"vectors": {"size": old_dim, "distance": "Cosine"}},
+        await _ensure_bucket_exists(client, bucket)
+        await asyncio.to_thread(
+            client.put_object,
+            Bucket=bucket, Key=key, Body=body, ContentType="application/json",
         )
-        r.raise_for_status()
-        for i in range(0, len(all_points), 256):
-            chunk = all_points[i : i + 256]
-            r = await c.put(
-                f"{QDRANT_URL}/collections/{backup_name}/points",
-                params={"wait": "true"},
-                json={"points": [
-                    {"id": p["id"], "vector": p["vector"], "payload": p.get("payload", {})}
-                    for p in chunk
-                ]},
-            )
-            r.raise_for_status()
-    logger.info("buddy-memory-migrate: backed up %d points → %s", len(all_points), backup_name)
+        return key
+    except Exception as exc:
+        logger.warning("Chat session S3 store failed for key '%s': %s", key, exc)
+        return None
 
-    # ── 3. Re-embed via Ollama (nomic-embed-text → 768-dim) ───────────────────
-    texts = [
-        (p.get("payload") or {}).get("text") or (p.get("payload") or {}).get("content") or ""
-        for p in all_points
-    ]
-    new_vectors: list[list[float]] = []
-    for i in range(0, len(texts), batch_size):
-        vecs = await _embed_batch(texts[i : i + batch_size])
-        new_vectors.extend(vecs)
 
-    new_dim = len(new_vectors[0]) if new_vectors else 768
+@app.post("/api/ingest/session")
+async def api_ingest_session(request: Request):
+    """Archive one chat-session snapshot to MinIO and Graphiti.
 
-    # ── 4. Recreate source collection with new dimension ──────────────────────
-    async with httpx.AsyncClient(timeout=60) as c:
-        await c.delete(f"{QDRANT_URL}/collections/{source}")
-        r = await c.put(
-            f"{QDRANT_URL}/collections/{source}",
-            json={"vectors": {"size": new_dim, "distance": "Cosine"}},
-        )
-        r.raise_for_status()
+    Expects JSON: {session_id, title, messages: [{role, content}, ...],
+    model, agent_id, access_level, collection}. Every call writes a new
+    snapshot of the full transcript — the OpenWebUI filter calls this after
+    each assistant turn.
 
-    # ── 5. Upsert re-embedded points ──────────────────────────────────────────
-    async with httpx.AsyncClient(timeout=120) as c:
-        for i in range(0, len(all_points), 256):
-            chunk   = all_points[i : i + 256]
-            ch_vecs = new_vectors[i : i + 256]
-            r = await c.put(
-                f"{QDRANT_URL}/collections/{source}/points",
-                params={"wait": "true"},
-                json={"points": [
-                    {"id": p["id"], "vector": vec, "payload": p.get("payload", {})}
-                    for p, vec in zip(chunk, ch_vecs)
-                ]},
-            )
-            r.raise_for_status()
+    Naming: the session's snapshots all live under one MinIO folder keyed by
+    session_id — stable for the life of the conversation, even though
+    OpenWebUI's own title starts as a generic placeholder ("New Chat") and
+    only gets renamed by its own async title-generation a turn or two later.
+    Each snapshot's filename carries the date, time, and the best
+    human-readable name available at that moment (the real title once
+    OpenWebUI has generated one, otherwise a snippet of the first user
+    message) — e.g.
+    chat-sessions/<session_id>/2026-08-22T14-05-30Z_what-is-the-capital-of-france.json
+    """
+    body = await request.json()
+    session_id = str(body.get("session_id") or "").strip()
+    title      = str(body.get("title") or "").strip()
+    messages   = body.get("messages") or []
+    model        = str(body.get("model") or "").strip()
+    agent_id     = str(body.get("agent_id") or "").strip()
+    access_level = str(body.get("access_level") or "public").strip()
+    collection   = str(body.get("collection") or "").strip() or GRAPHITI_CHAT_SESSIONS_GROUP_ID
 
-    logger.info(
-        "buddy-memory-migrate: %d points migrated %d→%d dim in '%s'",
-        len(all_points), old_dim, new_dim, source,
+    if not isinstance(messages, list) or not messages:
+        raise HTTPException(status_code=400, detail="messages must be a non-empty list")
+
+    transcript_text = _render_transcript(messages)
+    if not transcript_text:
+        raise HTTPException(status_code=422, detail="No text content in messages")
+
+    now       = datetime.now(timezone.utc)
+    timestamp = now.isoformat()
+    file_stamp = now.strftime("%Y-%m-%dT%H-%M-%SZ")
+
+    session_name    = _meaningful_session_name(title, messages, session_id)
+    name_slug       = _slugify(session_name)[:80] or "session"
+    session_folder  = _slugify(session_id)[:80] or name_slug
+    doc_title       = session_name
+
+    intended_key = f"{S3_CHAT_SESSIONS_PREFIX}{session_folder}/{file_stamp}_{name_slug}.json"
+    storage_key = await _store_chat_session_to_s3(
+        intended_key,
+        {
+            "session_id":    session_id,
+            "title":         title,
+            "session_name":  session_name,
+            "model":         model,
+            "message_count": len(messages),
+            "ingested_at":   timestamp,
+            "messages":      messages,
+        },
     )
-    return {
-        "status":     "ok",
-        "collection": source,
-        "migrated":   len(all_points),
-        "old_dim":    old_dim,
-        "new_dim":    new_dim,
-        "backup":     backup_name,
-    }
 
+    chunks = _chunk_text(transcript_text)
+    if not chunks:
+        raise HTTPException(status_code=422, detail="Transcript produced no chunks")
+    doc_id = hashlib.md5(f"{session_folder}-{timestamp}".encode()).hexdigest()[:16]
 
-async def _neo4j_ingest_tables(doc_id: str, tables: list) -> None:
-    """Create DocTable nodes in Neo4j linked to the parent Document."""
-    if not tables:
-        return
-    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-    now = _now_iso()
     try:
-        async with driver.session(database=NEO4J_DATABASE) as s:
-            for i, t in enumerate(tables):
-                await s.run(
-                    """MATCH (d:Document {document_id: $doc_id})
-                       CREATE (t:DocTable {
-                         table_id:   $tid,
-                         caption:    $caption,
-                         markdown:   $markdown,
-                         row_count:  $rows,
-                         col_count:  $cols,
-                         page:       $page,
-                         created_at: $now
-                       })
-                       CREATE (d)-[:HAS_TABLE]->(t)""",
-                    doc_id=doc_id, tid=f"{doc_id}-table-{i}",
-                    caption=t.caption, markdown=t.markdown,
-                    rows=t.row_count, cols=t.col_count,
-                    page=t.page, now=now,
-                )
-    finally:
-        await driver.close()
+        upserted = await graphiti_ingest(
+            collection, doc_id, doc_title,
+            f"chat_session:{session_id or session_folder}", chunks, agent_id, access_level,
+        )
+    except Exception as exc:
+        METRIC_INGEST_TOTAL.labels(status="graphiti_error").inc()
+        raise HTTPException(status_code=502, detail=f"Graphiti: {exc}")
+
+    METRIC_INGEST_TOTAL.labels(status="success").inc()
+    METRIC_INGEST_CHUNKS.observe(len(chunks))
+
+    result = {
+        "status":            "ok",
+        "document_id":       doc_id,
+        "title":             doc_title,
+        "session_id":        session_id,
+        "messages":          len(messages),
+        "chunks":            len(chunks),
+        "graphiti_episodes": upserted,
+        "collection":        collection,
+        "timestamp":         timestamp,
+    }
+    if storage_key:
+        result["storage"] = {"bucket": S3_BUCKET, "key": storage_key}
+    return result
+
+
+# The one-time Neo4j/Qdrant migration and backfill endpoints that used to
+# live here (ner-backfill, graph-backfill, graph-migrate-chunk-edges,
+# buddy-memory-migrate) were removed with the Graphiti/FalkorDB cutover —
+# see docs/adr/0001-graphiti-falkordb-backend.md. Graphiti extracts entities,
+# relationships, provenance, and temporal facts automatically from each
+# episode, so no separate backfill step exists in the new architecture.
 
 
 @app.post("/api/docint")
@@ -3279,7 +2211,7 @@ async def api_docint(
 ):
     """
     Standalone Document Intelligence endpoint.
-    Returns rich structured output without ingesting into Qdrant/Neo4j.
+    Returns rich structured output without ingesting into Graphiti.
     """
     filename = file.filename or "upload"
     data     = await file.read()
@@ -3527,7 +2459,7 @@ async def _extract_image_text(filename: str, data: bytes, ext: str) -> tuple[str
     """
     Returns (text, image_props) for all image formats.
     text      — descriptive string ready for chunking
-    image_props — flat dict stored on the Neo4j Document node as image_* fields
+    image_props — flat dict merged into the ingest response's image_metadata
     """
     import base64
 
@@ -3764,68 +2696,6 @@ async def _extract_image_text(filename: str, data: bytes, ext: str) -> tuple[str
     except ImportError as e:
         raise RuntimeError(f"Missing dependency for images: {e}. Run: pip install Pillow")
 
-_UPLOAD_FORM = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>EedgeAI — Ingest Document</title>
-  <style>
-    body{{font-family:system-ui,sans-serif;max-width:640px;margin:60px auto;padding:0 24px;background:#0f172a;color:#e2e8f0}}
-    h1{{color:#38bdf8;margin-bottom:4px}}
-    p{{color:#94a3b8;margin-top:0}}
-    form{{background:#1e293b;padding:28px;border-radius:12px;margin-top:24px}}
-    label{{display:block;font-size:.85rem;color:#94a3b8;margin-bottom:4px}}
-    input,select{{width:100%;padding:8px 12px;border:1px solid #334155;border-radius:6px;
-      background:#0f172a;color:#e2e8f0;font-size:.9rem;box-sizing:border-box;margin-bottom:16px}}
-    button{{background:#0ea5e9;color:#fff;border:none;padding:10px 28px;
-      border-radius:6px;font-size:1rem;cursor:pointer;width:100%}}
-    button:hover{{background:#38bdf8}}
-    .hint{{font-size:.78rem;color:#64748b;margin-top:-12px;margin-bottom:16px}}
-    .accepted{{color:#64748b;font-size:.8rem;margin-top:16px}}
-  </style>
-</head>
-<body>
-  <h1>Ingest Document</h1>
-  <p>Upload a file to index it into Neo4j + Qdrant for GCOR retrieval.</p>
-  <form method="POST" enctype="multipart/form-data">
-    <label>File</label>
-    <input type="file" name="file" accept=".txt,.md,.pdf,.docx,.json,.csv,.jpg,.jpeg,.png,.gif,.bmp,.webp,.tiff,.tif,.avif,.dcm,.dicom,.nii" required>
-    <p class="accepted">Accepted: .txt .md .pdf .docx .json .csv · images: .jpg .png .webp .tiff · medical: .dcm .dicom .nii .nii.gz</p>
-    <label>Title (optional — defaults to filename)</label>
-    <input type="text" name="title" placeholder="My Document">
-    <label>Agent ID (optional — leave blank for shared knowledge)</label>
-    <input type="text" name="agent_id" placeholder="">
-    <label>Access level</label>
-    <select name="access_level">
-      <option value="public">public</option>
-      <option value="restricted">restricted</option>
-    </select>
-    <button type="submit">Ingest</button>
-  </form>
-</body>
-</html>"""
-
-_RESULT_TMPL = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>Ingest result</title>
-  <style>
-    body{{font-family:system-ui,sans-serif;max-width:640px;margin:60px auto;padding:0 24px;background:#0f172a;color:#e2e8f0}}
-    h1{{color:{color}}}
-    pre{{background:#1e293b;padding:20px;border-radius:8px;overflow-x:auto;font-size:.85rem}}
-    a{{color:#38bdf8}}
-  </style>
-</head>
-<body>
-  <h1>{heading}</h1>
-  <pre>{body}</pre>
-  <p><a href="/ingest">&larr; Ingest another</a></p>
-</body>
-</html>"""
-
-
 def _extract_text(filename: str, data: bytes) -> str:
     ext = os.path.splitext(filename)[1].lower()
     if ext == ".pdf":
@@ -3882,330 +2752,7 @@ def _chunk_text(text: str, size: int = 2000, overlap: int = 200) -> list[str]:
     return chunks
 
 
-# ── NER Entity Extraction ─────────────────────────────────────────────────────
-
-async def _ner_extract(text: str) -> list[dict]:
-    """Call Ollama (OLLAMA_MODEL) to extract named entities from a chunk of text.
-
-    Uses response_format=json_object so Ollama is constrained to valid JSON.
-    Returns a list of dicts like {"text": "...", "type": "PERSON|ORG|..."}.
-    Falls back to [] on any error so ingest is never blocked.
-    """
-    system = (
-        "You are a named entity extractor. "
-        'Return a JSON object with a single key "entities" whose value is an array. '
-        'Each array item must have "text" (string) and "type" (one of: '
-        "PERSON, ORG, LOCATION, DATE, CONCEPT, TECH, PRODUCT, EVENT). "
-        "Include at most 15 of the most significant entities. "
-        "If there are none, return {\"entities\": []}."
-    )
-    user = f"Extract entities from:\n\n{text[:3000]}"
-    try:
-        async with httpx.AsyncClient(timeout=45) as c:
-            resp = await c.post(
-                f"{OLLAMA_BASE_URL}/v1/chat/completions",
-                json={
-                    "model":           OLLAMA_MODEL,
-                    "messages":        [
-                        {"role": "system", "content": system},
-                        {"role": "user",   "content": user},
-                    ],
-                    "temperature":     0,
-                    "response_format": {"type": "json_object"},
-                },
-            )
-            resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"].strip()
-        parsed = json.loads(content)
-        # Accept {"entities": [...]} or a bare array
-        if isinstance(parsed, list):
-            entities = parsed
-        else:
-            entities = parsed.get("entities") or parsed.get("Entities") or []
-            if not isinstance(entities, list):
-                entities = []
-        return [
-            e for e in entities
-            if isinstance(e, dict) and e.get("text") and e.get("type")
-        ]
-    except Exception as exc:
-        logger.warning("NER extraction failed: %s", exc)
-        return []
-
-
-_VALID_ENTITY_TYPES = frozenset(
-    {"PERSON", "ORG", "LOCATION", "DATE", "CONCEPT", "TECH", "PRODUCT", "EVENT"}
-)
-
-
-async def _neo4j_create_mentions(chunk_eids: list[str], chunks: list[str]) -> int:
-    """Extract entities per chunk and write :Entity nodes + MENTIONS rels to Neo4j.
-
-    Also creates :CO_OCCURS relationships between entities that appear in the
-    same chunk, which is the foundation for relational / graph reasoning.
-
-    Returns total number of MENTIONS relationships created.
-    Safe to call in a background task — errors are logged, not raised.
-    """
-    total = 0
-    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-    try:
-        async with driver.session(database=NEO4J_DATABASE) as s:
-            for eid, text in zip(chunk_eids, chunks):
-                try:
-                    entities = await _ner_extract(text)
-                except Exception as exc:
-                    logger.warning("NER failed for chunk %s: %s", eid, exc)
-                    continue
-
-                # Deduplicate and validate entities for this chunk
-                seen_names: list[str] = []
-                for ent in entities:
-                    name  = str(ent.get("text", "")).strip()
-                    etype = str(ent.get("type", "CONCEPT")).strip().upper()
-                    if not name:
-                        continue
-                    if etype not in _VALID_ENTITY_TYPES:
-                        etype = "CONCEPT"
-                    await s.run(
-                        """
-                        MATCH (c:Chunk) WHERE elementId(c) = $eid
-                        MERGE (e:Entity {name: $name, type: $etype})
-                          ON CREATE SET e.created_at = $now
-                        MERGE (c)-[:MENTIONS]->(e)
-                        """,
-                        eid=eid, name=name, etype=etype, now=_now_iso(),
-                    )
-                    seen_names.append(name)
-                    total += 1
-
-                # Create CO_OCCURS edges between all entity pairs in this chunk
-                if len(seen_names) >= 2:
-                    await s.run(
-                        """
-                        MATCH (c:Chunk) WHERE elementId(c) = $eid
-                        MATCH (c)-[:MENTIONS]->(e1:Entity)
-                        MATCH (c)-[:MENTIONS]->(e2:Entity)
-                        WHERE elementId(e1) < elementId(e2)
-                        MERGE (e1)-[r:CO_OCCURS]->(e2)
-                          ON CREATE SET r.weight = 1, r.created_at = $now
-                          ON MATCH  SET r.weight = r.weight + 1
-                        """,
-                        eid=eid, now=_now_iso(),
-                    )
-    except Exception as exc:
-        logger.error("_neo4j_create_mentions failed: %s", exc)
-    finally:
-        await driver.close()
-    logger.info("NER backfill: %d MENTIONS created for %d chunks", total, len(chunk_eids))
-    return total
-
-
-async def _neo4j_ingest(doc_id: str, title: str, source: str,
-                        chunks: list[str], agent_id: str, access_level: str,
-                        image_props: dict | None = None,
-                        valid_to: str | None = None):
-    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-    now = _now_iso()
-    try:
-        async with driver.session(database=NEO4J_DATABASE) as s:
-            doc_rec = await s.run(
-                """MERGE (d:Document {document_id: $doc_id})
-                   ON CREATE SET d.created_at = $now
-                   SET d.title = $title,
-                       d.source = $source,
-                       d.agent_id = $agent_id,
-                       d.access_level = $access_level,
-                       d.chunk_count = $cc
-                   SET d += $image_props
-                   RETURN elementId(d) AS eid""",
-                doc_id=doc_id, title=title, source=source,
-                agent_id=agent_id, access_level=access_level,
-                cc=len(chunks), now=now,
-                image_props=image_props or {},
-            )
-            doc_eid = (await doc_rec.single())["eid"]
-
-            chunk_eids = []
-            for i, text in enumerate(chunks):
-                cid = f"{doc_id}-chunk-{i}"
-                c_rec = await s.run(
-                    """MATCH (d:Document {document_id: $doc_id})
-                                             MERGE (c:Chunk {chunk_id: $cid})
-                                             ON CREATE SET c.created_at = $now
-                                             SET c.text = $text,
-                                                     c.position = $pos,
-                                                     c.document_id = $doc_id,
-                                                     c.document_title = $title,
-                                                     c.agent_id = $agent_id,
-                                                     c.access_level = $access_level,
-                                                     c.confidence = 1.0,
-                                                     c.valid_from = $now,
-                                                     c.valid_to = $valid_to
-                                             MERGE (d)-[:HAS_CHUNK]->(c)
-                       RETURN elementId(c) AS eid""",
-                    doc_id=doc_id, cid=cid, text=text, pos=i,
-                    title=title, agent_id=agent_id, access_level=access_level,
-                    now=now, valid_to=valid_to,
-                )
-                chunk_eids.append((await c_rec.single())["eid"])
-
-            # Link consecutive chunks with :NEXT for traversal
-            for j in range(len(chunk_eids) - 1):
-                await s.run(
-                    """MATCH (a:Chunk) WHERE elementId(a) = $a
-                       MATCH (b:Chunk) WHERE elementId(b) = $b
-                       MERGE (a)-[:NEXT]->(b)""",
-                    a=chunk_eids[j], b=chunk_eids[j + 1],
-                )
-        return doc_eid, chunk_eids
-    finally:
-        await driver.close()
-
-
-async def _qdrant_ingest(collection: str, chunks: list[str], chunk_eids: list[str],
-                         doc_id: str, title: str, agent_id: str, access_level: str,
-                         valid_to: str | None = None):
-    now = _now_iso()
-
-    # Embed in batches with retry + inter-batch delay
-    all_vectors: list[list[float]] = []
-    for i in range(0, len(chunks), EMBED_BATCH_SIZE):
-        batch = chunks[i:i + EMBED_BATCH_SIZE]
-        vecs = await _embed_batch(batch)
-        all_vectors.extend(vecs)
-        if i + EMBED_BATCH_SIZE < len(chunks):
-            await asyncio.sleep(EMBED_BATCH_DELAY)
-
-    # Ensure collection exists
-    async with httpx.AsyncClient(timeout=30) as c:
-        chk = await c.get(f"{QDRANT_URL}/collections/{collection}")
-        if chk.status_code == 404:
-            await c.put(
-                f"{QDRANT_URL}/collections/{collection}",
-                json={"vectors": {"size": len(all_vectors[0]), "distance": "Cosine"}},
-            )
-
-    # Upsert points
-    points = []
-    for i, (text, eid, vec) in enumerate(zip(chunks, chunk_eids, all_vectors)):
-        point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, eid))
-        points.append({
-            "id":      point_id,
-            "vector":  vec,
-            "payload": {
-                "text":             text,
-                "neo4j_element_id": eid,
-                "node_type":        "Chunk",
-                "document_id":      doc_id,
-                "document_title":   title,
-                "position":         i,
-                "agent_id":         agent_id,
-                "access_level":     access_level,
-                "confidence":       1.0,
-                "valid_from":       now,
-                "valid_to":         valid_to,
-            },
-        })
-
-    async with httpx.AsyncClient(timeout=60) as c:
-        resp = await c.put(
-            f"{QDRANT_URL}/collections/{collection}/points",
-            params={"wait": "true"},
-            json={"points": points},
-        )
-        resp.raise_for_status()
-
-    return len(points)
-
-
-@app.get("/ingest", response_class=HTMLResponse)
-async def ingest_form():
-    return _UPLOAD_FORM
-
-
-@app.post("/ingest")
-async def ingest_document(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    title: str = Form(""),
-    agent_id: str = Form(""),
-    access_level: str = Form("public"),
-    valid_hours: float = Form(0.0),
-):
-    filename = file.filename or "upload"
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty file")
-
-    ext = _resolve_ext(filename, data)
-    if ext not in _INGEST_ACCEPT:
-        raise HTTPException(
-            status_code=415,
-            detail=f"Unsupported file type '{ext}'. Accepted: {', '.join(sorted(_INGEST_ACCEPT))}",
-        )
-
-    doc_title   = title.strip() or filename
-    doc_id      = hashlib.md5(f"{filename}-{datetime.now().isoformat()}".encode()).hexdigest()[:16]
-    image_props: dict = {}
-
-    storage_key = await _store_original_to_s3(doc_id, filename, data)
-
-    try:
-        if _is_image(ext):
-            text, image_props = await _extract_image_text(filename, data, ext)
-        else:
-            text = _extract_text(filename, data)
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Text extraction failed: {exc}")
-
-    text = text.strip()
-    if not text:
-        raise HTTPException(status_code=422, detail="No text could be extracted from the file")
-
-    chunks = _chunk_text(text)
-    if not chunks:
-        raise HTTPException(status_code=422, detail="File produced no chunks after extraction")
-
-    if storage_key:
-        image_props["storage_bucket"] = S3_BUCKET
-        image_props["storage_key"] = storage_key
-
-    from datetime import timedelta
-    valid_to = (
-        (datetime.now(timezone.utc) + timedelta(hours=valid_hours)).isoformat()
-        if valid_hours > 0 else None
-    )
-    logger.info(
-        "Ingest '%s': %d chars → %d chunks (ext=%s, valid_to=%s)",
-        doc_title, len(text), len(chunks), ext, valid_to,
-    )
-
-    try:
-        upserted = await graphiti_ingest(
-            GRAPHITI_GROUP_ID, doc_id, doc_title, filename, chunks, agent_id, access_level,
-            valid_to=valid_to,
-        )
-    except Exception as exc:
-        logger.error("Graphiti ingest failed: %s", exc)
-        raise HTTPException(status_code=502, detail=f"Graphiti ingest failed: {exc}")
-
-    result = {
-        "status":        "ok",
-        "document_id":   doc_id,
-        "title":         doc_title,
-        "filename":      filename,
-        "chunks":        len(chunks),
-        "graphiti_episodes": upserted,
-        "collection":    GRAPHITI_GROUP_ID,
-    }
-    if valid_to:
-        result["valid_to"] = valid_to
-    logger.info("Ingest complete: %s", result)
-
-    return HTMLResponse(_RESULT_TMPL.format(
-        color="#4ade80",
-        heading=f"✓ Ingested \"{doc_title}\"",
-        body=json.dumps(result, indent=2),
-    ))
+# The legacy HTML-form /ingest endpoint (and its _neo4j_ingest/_qdrant_ingest
+# helpers) has been removed. /api/ingest below is the one ingest entry point;
+# it already writes to MinIO (S3) and Graphiti — see _ingest_bytes().
 

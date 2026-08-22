@@ -22,9 +22,9 @@ class Filter:
     does not touch or replace that. It runs alongside it: on every inlet, any
     newly attached file (body["files"], type == "file") is fetched back from
     OpenWebUI's own file API and forwarded to the GCOR proxy's /api/ingest, the
-    same endpoint the Knowledge UI uses. That lands the document in Neo4j +
-    Qdrant and persists the original to MinIO, so it becomes retrievable from
-    the Knowledge UI, OpenClaw, and Buzz too — not just this one OpenWebUI chat.
+    same endpoint the Knowledge UI uses. That lands the document in Graphiti
+    (FalkorDB) and persists the original to MinIO, so it becomes retrievable
+    from the Knowledge UI and OpenClaw too — not just this one OpenWebUI chat.
 
     Ingestion runs in the background (fire-and-forget) so it never delays the
     chat response; failures are logged, not surfaced to the user.
@@ -42,7 +42,7 @@ class Filter:
         )
         collection: str = Field(
             default="",
-            description="Target Qdrant collection. Empty = proxy default (QDRANT_COLLECTION).",
+            description="Target Graphiti group. Empty = proxy default (GRAPHITI_GROUP_ID).",
         )
         access_level: str = Field(default="public")
         agent_id: str = Field(default="")
