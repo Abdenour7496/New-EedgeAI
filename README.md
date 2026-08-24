@@ -23,7 +23,7 @@ Uploaded files and chat-session transcripts
       (S3-compatible durable storage)
 ```
 
-Neo4j, Qdrant, and the Buzz collaboration stack are no longer active services. Their old Docker volumes are intentionally retained by name for rollback/export; the new services do not mount or modify them. See [docs/adr/0001-graphiti-falkordb-backend.md](docs/adr/0001-graphiti-falkordb-backend.md) for the migration rationale, [docs/adr/0002-proxy-api-authentication.md](docs/adr/0002-proxy-api-authentication.md) for the API-key/OpenWebUI-as-front-door decision, and [openwebui-functions/README.md](openwebui-functions/README.md) for the chat-capture Functions.
+Neo4j, Qdrant, and the Buzz collaboration stack are no longer active services, and their Docker volume declarations (`neo4j_data`, `qdrant_data`, `buzz_postgres_data`, `buzz_redis_data`, `buzz_git_data`) have been removed from `docker-compose.unified.yml` — nothing mounted or backed them up after the Graphiti/FalkorDB migration. If you deployed before that cleanup, the underlying volumes may still exist on the host (`docker volume ls`); they're safe to remove once you've confirmed you don't need to roll back. See [docs/adr/0001-graphiti-falkordb-backend.md](docs/adr/0001-graphiti-falkordb-backend.md) for the migration rationale, [docs/adr/0002-proxy-api-authentication.md](docs/adr/0002-proxy-api-authentication.md) for the API-key/OpenWebUI-as-front-door decision, and [openwebui-functions/README.md](openwebui-functions/README.md) for the chat-capture Functions.
 
 **OpenWebUI (`:8080`) is the only surface meant for end users.** Every other service — the Knowledge UI, Graphiti's REST docs, Grafana, Prometheus, the MinIO/FalkorDB browsers, OpenClaw's control UI — is an operator/admin tool, bound to `127.0.0.1` by default (reach it via an SSH tunnel or `kubectl port-forward`, not by opening the port). See [Authentication](#authentication) below.
 
@@ -37,7 +37,7 @@ CPU-only local extraction is also slow — several minutes per ingest call is no
 
 A local model can also return incomplete or malformed structured JSON for one of Graphiti's internal extraction steps (missing required fields, or occasionally echoing the JSON schema itself instead of data), which graphiti-core doesn't tolerate by default. `graphiti/app.py` patches this at startup across every affected response model so a partial response degrades to safe defaults instead of failing the whole ingest — see [docs/adr/0003-graphiti-edgeduplicate-hotfix.md](docs/adr/0003-graphiti-edgeduplicate-hotfix.md). A rising rate of its warning logs (`docker compose logs graphiti | grep graphiti_hotfix`) is a real signal the configured model is unreliable and worth upgrading.
 
-This cutover does not automatically transform legacy Neo4j/Qdrant data. Re-ingest source documents to populate Graphiti. Legacy volumes are retained until migration has been accepted. Graphiti groups also have no rename/archive concept — see [Operations](#operations).
+This cutover does not automatically transform legacy Neo4j/Qdrant data. Re-ingest source documents to populate Graphiti. Graphiti groups also have no rename/archive concept — see [Operations](#operations).
 
 ## Start
 

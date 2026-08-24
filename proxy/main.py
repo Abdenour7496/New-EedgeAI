@@ -58,6 +58,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Stre
 from prometheus_client import Counter, Histogram
 from prometheus_fastapi_instrumentator import Instrumentator
 from document_intel import process_document, DocIntelResult
+from governance import validate_access_level
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -680,7 +681,9 @@ def _filter_hits(hits: list) -> list:
             continue
 
         # ── access control ────────────────────────────────────────────────────
-        access_level = p.get("access_level", "public")
+        # `or "public"` (not just a dict default) because a payload can carry
+        # access_level=None explicitly, not merely omit the key.
+        access_level = p.get("access_level") or "public"
         if access_level == "restricted":
             logger.debug("Dropping hit %s: restricted access", h.get("id"))
             continue
@@ -1933,6 +1936,10 @@ async def _ingest_bytes(
     Raises HTTPException on failure."""
     if not data:
         raise HTTPException(status_code=400, detail="Empty file")
+    try:
+        access_level = validate_access_level(access_level)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
     ext = _resolve_ext(filename, data)
     if ext not in _INGEST_ACCEPT:
@@ -2167,7 +2174,10 @@ async def api_ingest_session(request: Request):
     messages   = body.get("messages") or []
     model        = str(body.get("model") or "").strip()
     agent_id     = str(body.get("agent_id") or "").strip()
-    access_level = str(body.get("access_level") or "public").strip()
+    try:
+        access_level = validate_access_level(str(body.get("access_level") or "").strip())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     collection   = str(body.get("collection") or "").strip() or GRAPHITI_CHAT_SESSIONS_GROUP_ID
 
     if not isinstance(messages, list) or not messages:

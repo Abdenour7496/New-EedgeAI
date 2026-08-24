@@ -20,5 +20,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
 COPY document_intel.py .
+COPY governance.py .
 COPY templates/ ./templates/
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "5001"]

@@ -1,9 +1,7 @@
 import pathlib
 import sys
 import unittest
-from unittest.mock import AsyncMock, patch
-
-from starlette.requests import Request
+from unittest.mock import patch
 
 
 PROXY_DIR = pathlib.Path(__file__).resolve().parents[1]
@@ -26,9 +24,15 @@ class _FakeResponse:
             raise RuntimeError(f"HTTP {self.status_code}")
 
 
-class _FakeAsyncClient:
-    def __init__(self, payloads):
-        self._payloads = payloads
+class _FakeGetClient:
+    """Mimics httpx.AsyncClient for GET-only callers (api_collections,
+    api_collection_docs), routing by the last URL path segment."""
+
+    def __init__(self, payloads_by_name=None, payload=None):
+        self._payloads_by_name = payloads_by_name
+        self._payload = payload
+        self.requested_urls = []
+        self.requested_params = []
 
     async def __aenter__(self):
         return self
@@ -36,12 +40,44 @@ class _FakeAsyncClient:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def get(self, url):
-        if url.endswith("/collections"):
-            return _FakeResponse(self._payloads["collections"])
+    async def get(self, url, params=None):
+        self.requested_urls.append(url)
+        self.requested_params.append(params)
+        if self._payloads_by_name is not None:
+            name = url.rsplit("/", 1)[-1]
+            return _FakeResponse(self._payloads_by_name.get(name, []))
+        return _FakeResponse(self._payload)
 
-        name = url.rsplit("/", 1)[-1]
-        return _FakeResponse(self._payloads["details"][name])
+
+class _FailingGetClient:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def get(self, url, params=None):
+        raise RuntimeError("graphiti unreachable")
+
+
+class _FakePostClient:
+    """Mimics httpx.AsyncClient for graphiti_search's single POST /search call."""
+
+    def __init__(self, payload):
+        self._payload = payload
+        self.requested_url = None
+        self.requested_json = None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def post(self, url, json):
+        self.requested_url = url
+        self.requested_json = json
+        return _FakeResponse(self._payload)
 
 
 class _FakeStreamResponse:
@@ -77,18 +113,9 @@ class _FakeStreamingClient:
         return self._response
 
 
-class _NoGetAsyncClient:
-    async def __aenter__(self):
-        return self
+def _request(headers: dict[str, str] | None = None):
+    from starlette.requests import Request
 
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
-
-    async def get(self, url):
-        raise AssertionError("A workspace-scoped search must not discover extra collections")
-
-
-def _request(headers: dict[str, str] | None = None) -> Request:
     return Request({
         "type": "http",
         "headers": [
@@ -125,108 +152,90 @@ class CollectionMetadataTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(exc_info.exception.status_code, 400)
 
-    async def test_qdrant_search_scopes_to_selected_collection(self):
-        hit = {
-            "id": "finance-hit",
-            "score": 0.85,
-            "payload": {},
-            "_collection": "bills_and_expenses",
+    async def test_graphiti_search_maps_facts_to_hits_and_records(self):
+        facts_payload = {
+            "facts": [
+                {
+                    "uuid": "fact-1",
+                    "fact": "Invoice #42 is due 2026-09-01",
+                    "name": "Invoice #42",
+                    "episodes": ["ep-1"],
+                    "valid_at": "2026-08-01T00:00:00Z",
+                },
+                {
+                    "uuid": "fact-2",
+                    "fact": "Invoice #43 was paid",
+                    "name": "Invoice #43",
+                    "episodes": ["ep-2"],
+                },
+            ]
         }
-        with patch.object(main.httpx, "AsyncClient", return_value=_NoGetAsyncClient()), \
-             patch.object(
-                 main, "_qdrant_search_collection", new=AsyncMock(return_value=[hit])
-             ) as search_mock:
-            results = await main.qdrant_search([0.1, 0.2], collection="bills_and_expenses")
+        fake_client = _FakePostClient(facts_payload)
 
-        search_mock.assert_awaited_once()
-        self.assertEqual(search_mock.await_args.args[1], "bills_and_expenses")
-        self.assertEqual(results[0]["_collection"], "bills_and_expenses")
+        with patch.object(main.httpx, "AsyncClient", return_value=fake_client):
+            hits, records = await main.graphiti_search("invoice status", group_id="documents")
 
-    def test_memory_expand_query_uses_aggregated_event_ordering(self):
-        memory_query = main._EXPAND_CYPHER["memory"]
+        self.assertTrue(fake_client.requested_url.endswith("/search"))
+        self.assertEqual(fake_client.requested_json["group_ids"], ["documents"])
+        self.assertEqual(len(hits), 2)
+        self.assertEqual(hits[0]["id"], "fact-1")
+        self.assertEqual(hits[0]["payload"]["document_id"], "ep-1")
+        self.assertEqual(hits[0]["payload"]["access_level"], "public")
+        self.assertEqual(hits[0]["payload"]["confidence"], 1.0)
+        # Rank 0 scores strictly higher than rank 1.
+        self.assertGreater(hits[0]["score"], hits[1]["score"])
+        self.assertEqual(records[0]["labels"], ["TemporalFact"])
 
-        self.assertIn("max(evt.timestamp) AS latest_event_ts", memory_query)
-        self.assertIn("ORDER BY latest_event_ts DESC", memory_query)
-        self.assertNotIn("ORDER BY evt.timestamp DESC", memory_query)
-
-    async def test_api_collection_docs_uses_collection_doc_ids(self):
-        docs = [
-            {
-                "doc_id": "doc-x",
-                "title": "Doc X",
-                "created_at": "2026-04-05T14:01:39Z",
-                "access_level": "public",
-                "chunk_count": 1,
-            }
+    async def test_api_collection_docs_maps_graphiti_episodes(self):
+        episodes = [
+            {"uuid": "ep-1", "name": "Doc A", "created_at": "2026-04-05T14:01:39Z"},
+            {"uuid": "ep-2", "name": "Doc B", "valid_at": "2026-04-06T09:00:00Z"},
         ]
+        fake_client = _FakeGetClient(payload=episodes)
 
-        with patch.object(main, "_qdrant_collection_doc_ids", new=AsyncMock(return_value=["doc-x"])) as doc_ids_mock, \
-             patch.object(main, "_neo4j_fetch_documents", new=AsyncMock(return_value=docs)) as fetch_docs_mock:
-            result = await main.api_collection_docs("ingestion_smoketest")
+        with patch.object(main.httpx, "AsyncClient", return_value=fake_client):
+            result = await main.api_collection_docs("documents")
 
-        self.assertEqual(result["collection"], "ingestion_smoketest")
-        self.assertEqual(result["docs"], docs)
-        doc_ids_mock.assert_awaited_once_with("ingestion_smoketest", limit=200)
-        fetch_docs_mock.assert_awaited_once_with(["doc-x"])
+        self.assertEqual(result["collection"], "documents")
+        self.assertEqual(len(result["docs"]), 2)
+        self.assertEqual(result["docs"][0]["doc_id"], "ep-1")
+        self.assertEqual(result["docs"][0]["title"], "Doc A")
+        self.assertEqual(result["docs"][0]["created_at"], "2026-04-05T14:01:39Z")
+        # Falls back to valid_at when created_at is absent.
+        self.assertEqual(result["docs"][1]["created_at"], "2026-04-06T09:00:00Z")
+        self.assertTrue(fake_client.requested_urls[0].endswith("/episodes/documents"))
 
-    async def test_api_collection_docs_preserves_not_found_status(self):
-        not_found = main.HTTPException(status_code=404, detail="Collection missing")
-
-        with patch.object(main, "_qdrant_collection_doc_ids", new=AsyncMock(side_effect=not_found)):
+    async def test_api_collection_docs_raises_502_on_upstream_failure(self):
+        with patch.object(main.httpx, "AsyncClient", return_value=_FailingGetClient()):
             with self.assertRaises(main.HTTPException) as exc_info:
-                await main.api_collection_docs("missing")
+                await main.api_collection_docs("documents")
 
-        self.assertEqual(exc_info.exception.status_code, 404)
+        self.assertEqual(exc_info.exception.status_code, 502)
 
-    async def test_api_collections_enriches_each_collection_independently(self):
-        payloads = {
-            "collections": {
-                "result": {
-                    "collections": [
-                        {"name": "documents"},
-                        {"name": "buddy_memory"},
-                    ]
-                }
-            },
-            "details": {
-                "documents": {"result": {"points_count": 3}},
-                "buddy_memory": {"result": {"points_count": 1}},
-            },
+    async def test_api_collections_reports_per_group_episode_counts(self):
+        payloads_by_name = {
+            "documents": [
+                {"uuid": "ep-1", "name": "Doc A", "created_at": "2026-04-05T14:01:39Z"},
+                {"uuid": "ep-2", "name": "Doc B", "created_at": "2026-04-06T09:00:00Z"},
+            ],
+            "buddy_memory": [],
+            "chat_sessions": [],
         }
-        fake_client = _FakeAsyncClient(payloads)
-        doc_side_effect = [["doc-a", "doc-b"], []]
-        recent_docs_side_effect = [[
-            {
-                "doc_id": "doc-a",
-                "title": "Doc A",
-                "created_at": "2026-04-05T14:01:39Z",
-                "access_level": "public",
-                "chunk_count": 2,
-            },
-            {
-                "doc_id": "doc-b",
-                "title": "Doc B",
-                "created_at": "2026-04-05T14:01:40Z",
-                "access_level": "restricted",
-                "chunk_count": 1,
-            },
-        ], []]
+        fake_client = _FakeGetClient(payloads_by_name=payloads_by_name)
 
         with patch.object(main.httpx, "AsyncClient", return_value=fake_client), \
-             patch.object(main, "_qdrant_collection_doc_ids", new=AsyncMock(side_effect=doc_side_effect)) as doc_ids_mock, \
-             patch.object(main, "_neo4j_fetch_documents", new=AsyncMock(side_effect=recent_docs_side_effect)) as fetch_docs_mock:
+             patch.object(main, "GRAPHITI_GROUP_ID", "documents"), \
+             patch.object(main, "RAG_EXTRA_COLLECTIONS", ["buddy_memory"]), \
+             patch.object(main, "GRAPHITI_CHAT_SESSIONS_GROUP_ID", "chat_sessions"):
             result = await main.api_collections()
 
-        collections = {col["name"]: col for col in result["collections"]}
-
-        self.assertEqual(collections["documents"]["doc_count"], 2)
-        self.assertEqual(len(collections["documents"]["recent_docs"]), 2)
-        self.assertEqual(collections["documents"]["recent_docs"][0]["doc_id"], "doc-a")
-        self.assertEqual(collections["buddy_memory"]["doc_count"], 0)
-        self.assertEqual(collections["buddy_memory"]["recent_docs"], [])
-        self.assertEqual(doc_ids_mock.await_count, 2)
-        fetch_docs_mock.assert_any_await(["doc-a", "doc-b"], limit=5)
-        fetch_docs_mock.assert_any_await([], limit=5)
+        by_name = {c["name"]: c for c in result["collections"]}
+        self.assertEqual(set(by_name), {"documents", "buddy_memory", "chat_sessions"})
+        self.assertEqual(by_name["documents"]["doc_count"], 2)
+        self.assertEqual(len(by_name["documents"]["recent_docs"]), 2)
+        self.assertEqual(by_name["documents"]["recent_docs"][0]["doc_id"], "ep-1")
+        self.assertEqual(by_name["buddy_memory"]["doc_count"], 0)
+        self.assertEqual(by_name["buddy_memory"]["recent_docs"], [])
 
     async def test_call_openclaw_stream_adds_terminal_stop_chunk(self):
         upstream_lines = [

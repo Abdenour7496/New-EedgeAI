@@ -328,6 +328,7 @@ services:
     volumes:
       - ./proxy/main.py:/app/main.py:ro
       - ./proxy/document_intel.py:/app/document_intel.py:ro
+      - ./proxy/governance.py:/app/governance.py:ro
       - ./proxy/templates:/app/templates:ro
     healthcheck:
       test: ["CMD", "python", "-c",
@@ -593,16 +594,9 @@ services:
 
 volumes:
   falkordb_data:
-  # Legacy volumes are deliberately retained for rollback/data export. No active
-  # service mounts them after the Graphiti/FalkorDB migration.
-  neo4j_data:
-  qdrant_data:
   openclaw_config:
   openclaw_claude_config:
   openclaw_codex_config:
   openwebui_data:
   ollama_data:
   docs_minio_data:
-  buzz_postgres_data:
-  buzz_redis_data:
-  buzz_git_data:

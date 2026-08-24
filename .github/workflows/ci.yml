@@ -1,0 +1,57 @@
+name: CI
+
+# Release gate: nothing merges to master without these passing. See
+# docs/adr/0005-ci-release-gate.md for what's covered, what's deliberately
+# left informational, and why.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  compose-validate:
+    name: Validate docker-compose.unified.yml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker compose config
+        run: docker compose -f docker-compose.unified.yml config -q
+
+  python-syntax:
+    name: Python syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile every tracked .py file
+        run: git ls-files '*.py' | xargs -r python -m py_compile
+
+  proxy-tests:
+    name: Proxy unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build proxy image
+        run: docker build -t eedgeai-proxy-ci ./proxy
+      - name: Run unit tests
+        # Only the unit suite — test_openwebui_stream_smoke.py needs a live
+        # stack (PROXY_CHAT_URL) and is a post-deploy check, not a CI gate.
+        # Code mounted fresh over the built image so this always runs against
+        # the working tree, not whatever was COPYed at image-build time.
+        run: |
+          docker run --rm -v "${{ github.workspace }}/proxy:/app" -w /app eedgeai-proxy-ci \
+            python -m unittest tests/test_collection_metadata.py tests/test_governance.py -v
+
+  image-pin-report:
+    name: Report unpinned image tags (informational, non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: List services still on :latest
+        run: |
+          echo "Known, tracked debt — see README.md — not a merge blocker:"
+          grep -n "image:.*:latest" docker-compose.unified.yml || echo "None found."
