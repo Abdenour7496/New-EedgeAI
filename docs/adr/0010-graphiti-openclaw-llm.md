@@ -144,3 +144,42 @@ Verified before and after switching:
   ("background OpenAI-compatible API workloads, separate from the
   interactive Codex and Claude Code runtimes") is superseded by this ADR
   for the LLM half — updated alongside this fix.
+
+## Addendum 2 (same day): debounce chat-session archival instead of firing every turn
+
+Even with extraction fast (~8s/call via openclaw), `gcor_chat_session_ingest`
+firing on every single assistant turn was still wasteful: each snapshot
+re-sends the FULL transcript, not a diff, so a 20-turn conversation would
+re-extract from scratch 20 times — O(n²) total work as a conversation grows
+— and rapid back-and-forth could stack concurrent extraction jobs for the
+same chat.
+
+Fixed with a debounce: every `outlet` call (re)starts a
+`debounce_seconds` (default 60s) timer for that `chat_id`, cancelling
+whichever timer was already pending for it; the transcript only actually
+archives once the conversation goes quiet for that long. An `_in_flight`
+guard additionally prevents a new turn from starting a second concurrent
+archive for a chat whose previous one (from an earlier quiet period) is
+still running.
+
+Caught a real concurrency bug while unit-testing this before installing it:
+the first implementation checked `_in_flight` *inside* the debounce
+task, after cancellation was already handled — but `outlet()`'s "supersede
+the pending timer" logic would `.cancel()` whatever task was in
+`_debounce_tasks[chat_id]` unconditionally, including one that had already
+finished its debounce wait and was actively mid-archive. Cancelling it
+triggered its `finally: self._in_flight.discard(...)`, clearing the guard,
+and the new turn's task then proceeded to start a second, genuinely
+concurrent archive for the same chat — reproduced directly: `['start',
+'start', 'end']` instead of `['start', 'end']` in a scripted test.
+
+Fixed by checking `_in_flight` in `outlet()` **before** touching
+`_debounce_tasks` at all: if a chat is already actively archiving, the new
+turn just returns without cancelling or scheduling anything, preserving the
+invariant that a task in `_debounce_tasks` is *only ever* still in its
+debounce sleep, never mid-archive — so cancelling it is always safe.
+Verified with three scripted tests after the fix: a burst of 5 rapid turns
+on one chat produces exactly 1 archive call; a turn arriving while a slow
+archive is genuinely in flight is skipped, not stacked (`['start', 'end']`);
+and two turns separated by more than the debounce window each archive
+independently (not permanently blocked by the first).

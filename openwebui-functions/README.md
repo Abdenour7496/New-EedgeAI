@@ -3,14 +3,21 @@
 ## gcor_chat_session_ingest.py
 
 Archives the chat session itself — not just its attachments — into the GCOR
-knowledge pipeline. On every outlet (after each assistant turn), it fetches
-the chat's current title and full message history back from OpenWebUI's own
-`/api/v1/chats/{id}` API and forwards them to the GCOR proxy's
-`/api/ingest/session`. That endpoint writes a JSON snapshot of the transcript
-to MinIO under `chat-sessions/<session_id>/<date-time>_<name>.json` and
-indexes it into Graphiti (group `chat_sessions` by default, kept separate
-from the document group), so past conversations are retrievable the same way
-uploaded documents are.
+knowledge pipeline. Debounced, not fired on every turn: each assistant turn
+restarts a `debounce_seconds` (default 60s) quiet-period timer for that
+chat, cancelling whichever timer was already pending for it; only once the
+conversation pauses that long does it fetch the chat's current title and
+full message history back from OpenWebUI's own `/api/v1/chats/{id}` API and
+forward them to the GCOR proxy's `/api/ingest/session`. (Each snapshot
+re-sends the full transcript, not a diff — archiving on every turn would
+re-run full extraction over the whole growing conversation each time.) A
+guard also prevents a new turn from starting a second, concurrent archive
+for a chat whose previous one is still running. That endpoint writes a JSON
+snapshot of the transcript to MinIO under
+`chat-sessions/<session_id>/<date-time>_<name>.json` and indexes it into
+Graphiti (group `chat_sessions` by default, kept separate from the document
+group), so past conversations are retrievable the same way uploaded
+documents are.
 
 Naming: the folder is keyed by the chat's stable `session_id`, so a
 conversation's snapshots stay together for its whole life. Each snapshot's
@@ -30,11 +37,12 @@ For example: `chat-sessions/3f9a2b7c-.../2026-08-22T14-05-30Z_what-is-the-capita
 4. Optional valve settings: `collection` (target Graphiti group, blank =
    proxy default `chat_sessions`), `access_level`, `agent_id`, `min_messages`
    (skip archiving a session until it has at least this many messages —
-   default 2, i.e. at least one full user/assistant exchange).
+   default 2, i.e. at least one full user/assistant exchange),
+   `debounce_seconds` (quiet period before archiving — default 60).
 
 ### Verify it's working
 
-Have a short conversation, then:
+Have a short conversation, wait past `debounce_seconds` (60s by default) after your last message, then:
 
 ```bash
 docker compose -f docker-compose.unified.yml logs -f openwebui | grep gcor_chat_session_ingest

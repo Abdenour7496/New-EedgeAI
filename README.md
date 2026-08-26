@@ -105,9 +105,11 @@ Files attached during an Open WebUI chat, and the chat session itself, are captu
 | Function | Captures | Stored at | Indexed into |
 |---|---|---|---|
 | `gcor_file_ingest.py` | files attached to a chat message | `documents/originals/<doc_id>/<filename>` | Graphiti group `documents` (or the workspace's selected group) |
-| `gcor_chat_session_ingest.py` | the conversation itself, after every assistant turn | `documents/chat-sessions/<session_id>/<date-time>_<meaningful-name>.json` | Graphiti group `chat_sessions` |
+| `gcor_chat_session_ingest.py` | the conversation itself, debounced (see below) | `documents/chat-sessions/<session_id>/<date-time>_<meaningful-name>.json` | Graphiti group `chat_sessions` |
 
 Chat-session naming: the folder is keyed by the chat's stable `session_id`, so a conversation's snapshots stay together for its whole life even as Open WebUI's own title changes. Each snapshot's filename carries the date, time, and the best human-readable name available at that moment — the real chat title once Open WebUI has generated one, otherwise a snippet of the first user message (Open WebUI's placeholder title, e.g. "New Chat", is never used as the name). Example: `chat-sessions/3f9a2b7c-.../2026-08-22T14-05-30Z_what-is-the-capital-of-france.json`.
+
+Chat-session archival is debounced, not fired after every turn: each new assistant turn restarts a `debounce_seconds` (default 60s) quiet-period timer for that chat, and the transcript only actually archives once the conversation pauses that long — since each snapshot re-sends the full transcript rather than a diff, archiving on every turn would re-run full extraction over the whole growing conversation each time.
 
 Past conversations are searchable the same way documents are:
 
