@@ -1953,6 +1953,41 @@ async def _ingest_bytes(
     target_bucket = _validate_bucket_name(bucket.strip() or S3_BUCKET)
     storage_key = await _store_original_to_s3(doc_id, filename, data, bucket=target_bucket)
 
+    async def _run_docint() -> str:
+        nonlocal image_props, docint_summary
+        result: DocIntelResult = await process_document(filename, data)
+        image_props = result.image_props
+        docint_summary = {
+            "document_type":    result.document_type,
+            "document_subtype": result.document_subtype,
+            "is_scanned":       result.is_scanned,
+            "pages":            result.pages,
+            "language":         result.language,
+            "tables":           len(result.tables),
+            "form_fields":      len(result.form_fields),
+            "entities": {
+                "dates":         result.entities.dates[:5],
+                "amounts":       result.entities.amounts[:5],
+                "names":         result.entities.names[:5],
+                "organizations": result.entities.organizations[:5],
+            },
+        }
+        return result.to_rich_text().strip()
+
+    # PDFs/DOCX where OCR was never asked for, but the plain-text layer turns
+    # out empty (e.g. a scanned page with no embedded text — a photographed
+    # ID or a screenshotted webpage saved as PDF), auto-retry through the
+    # Document Intelligence/OCR pipeline before giving up. Before this,
+    # `enable_docint` defaulted to false for every entry point including
+    # `gcor_file_ingest` (no chat user can pass that flag), so any scanned
+    # attachment failed with a silent 422 and the assistant reporting "I
+    # don't see anything attached" — see
+    # docs/adr/0009-ingest-ocr-auto-fallback.md. Text-native formats
+    # (.txt/.md/.json/.csv) are excluded: empty output there means an
+    # actually-empty file, not something OCR could rescue, so they still
+    # fail fast instead of paying for a ~1-2 minute OCR pass for nothing.
+    _OCR_FALLBACK_EXTS = {".pdf", ".docx"}
+
     try:
         if ext in _MEDICAL_EXTS or _is_image(ext):
             # Medical and image formats always use their dedicated handlers —
@@ -1961,26 +1996,12 @@ async def _ingest_bytes(
             text = text.strip()
         elif enable_docint:
             # Full Document Intelligence pipeline (PDFs, DOCX, scanned docs)
-            result: DocIntelResult = await process_document(filename, data)
-            text        = result.to_rich_text().strip()
-            image_props = result.image_props
-            docint_summary = {
-                "document_type":    result.document_type,
-                "document_subtype": result.document_subtype,
-                "is_scanned":       result.is_scanned,
-                "pages":            result.pages,
-                "language":         result.language,
-                "tables":           len(result.tables),
-                "form_fields":      len(result.form_fields),
-                "entities": {
-                    "dates":         result.entities.dates[:5],
-                    "amounts":       result.entities.amounts[:5],
-                    "names":         result.entities.names[:5],
-                    "organizations": result.entities.organizations[:5],
-                },
-            }
+            text = await _run_docint()
         else:
             text = _extract_text(filename, data).strip()
+            if not text and ext in _OCR_FALLBACK_EXTS:
+                text = await _run_docint()
+                enable_docint = True  # reflect what actually ran in the response/logs
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Extraction failed: {exc}")
 

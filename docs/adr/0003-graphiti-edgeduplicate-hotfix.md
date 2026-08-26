@@ -113,3 +113,25 @@ Delete the patch block in `graphiti/app.py` (self-contained, directly under
 the `graphiti_core` imports) and rebuild the `graphiti` image. The
 underlying crashes return; nothing else in this ADR depends on the patch
 being present.
+
+## 2026-08-24 addendum: nested list[BaseModel] fields weren't actually covered
+
+Observed directly, not anticipated: `ExtractedEdges` was already in the
+patched-model list above, but a real ingest still crashed with
+`ValidationError: edges.0.source_entity_id — Input should be a valid
+integer [input_value=None]`. Root cause: patching a model's own
+`__init__` only intercepts an *explicit* `Model(**data)` call in Python —
+it does not intercept nested `list[SomeModel]` fields, which
+pydantic-core validates straight from the raw dicts via its compiled
+schema, never calling the nested model's `__init__`. So `ExtractedEdges`
+being patched never helped its own `edges: list[Edge]` field when an item
+had an explicit `null` for a required int.
+
+Fixed by making `_lenient_init` sanitize nested `list[BaseModel]` fields
+recursively *before* handing data to the real pydantic `__init__` — see
+`_sanitize_for_model` in `graphiti/app.py`. This also closes the same
+latent gap in `NodeResolutions.entity_resolutions: list[NodeDuplicate]`
+and `ExtractedEntities.extracted_entities: list[ExtractedEntity]`, which
+carry the same risk but hadn't been observed crashing yet. Re-verified all
+9 patched models with fully-empty input and a normal well-formed
+round-trip after this change — no regressions.

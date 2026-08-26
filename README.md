@@ -25,7 +25,7 @@ Uploaded files and chat-session transcripts
 
 Neo4j, Qdrant, and the Buzz collaboration stack are no longer active services, and their Docker volume declarations (`neo4j_data`, `qdrant_data`, `buzz_postgres_data`, `buzz_redis_data`, `buzz_git_data`) have been removed from `docker-compose.unified.yml` — nothing mounted or backed them up after the Graphiti/FalkorDB migration. If you deployed before that cleanup, the underlying volumes may still exist on the host (`docker volume ls`); they're safe to remove once you've confirmed you don't need to roll back. See [docs/adr/0001-graphiti-falkordb-backend.md](docs/adr/0001-graphiti-falkordb-backend.md) for the migration rationale, [docs/adr/0002-proxy-api-authentication.md](docs/adr/0002-proxy-api-authentication.md) for the API-key/OpenWebUI-as-front-door decision, and [openwebui-functions/README.md](openwebui-functions/README.md) for the chat-capture Functions.
 
-**OpenWebUI (`:8080`) is the only surface meant for end users.** Every other service — the Knowledge UI, Graphiti's REST docs, Grafana, Prometheus, the MinIO/FalkorDB browsers, OpenClaw's control UI — is an operator/admin tool, bound to `127.0.0.1` by default (reach it via an SSH tunnel or `kubectl port-forward`, not by opening the port). See [Authentication](#authentication) below.
+**`https://<host>:8443` (behind Caddy, in front of OpenWebUI) is the only surface meant for end users.** Every other service — OpenWebUI's own `:8080`, the Knowledge UI, Graphiti's REST docs, Grafana, Prometheus, the MinIO/FalkorDB browsers, OpenClaw's control UI — is an operator/admin tool, bound to `127.0.0.1` by default (reach it via an SSH tunnel or `kubectl port-forward`, not by opening the port). See [Authentication](#authentication) below.
 
 ## Feasibility and trade-offs
 
@@ -65,13 +65,16 @@ Leaving `GCOR_API_KEY` blank leaves those endpoints open — the proxy logs a st
 
 OpenWebUI itself is the authenticated human front door: set `WEBUI_SECRET_KEY` (also in `.env`) to a fixed value so sessions survive a restart, and leave `OPENWEBUI_ENABLE_SIGNUP=false` once the first admin account exists.
 
+`caddy` terminates TLS for that front door with a self-signed certificate (`tls internal` — see [docs/adr/0006-tls-reverse-proxy.md](docs/adr/0006-tls-reverse-proxy.md)), so browsers show a one-time "certificate not trusted" warning until you trust Caddy's local CA or swap in a real certificate. This is expected for a LAN/dev deployment; the ADR covers switching to a real domain + Let's Encrypt.
+
 ## Services
 
-Everything except Open WebUI is bound to `127.0.0.1` by default — these URLs work from the docker host itself; reach them remotely via an SSH tunnel or `kubectl port-forward` (see [Authentication](#authentication)).
+Everything except `caddy` is bound to `127.0.0.1` by default — these URLs work from the docker host itself; reach them remotely via an SSH tunnel or `kubectl port-forward` (see [Authentication](#authentication)).
 
 | Service | URL / port | Purpose |
 |---|---|---|
-| Open WebUI | http://localhost:8080 | chat UI — the one surface meant for end users |
+| Open WebUI (via Caddy/TLS) | https://localhost:8443 | chat UI — the one surface meant for end users |
+| Open WebUI (direct, no TLS) | http://localhost:8080 | same app, unencrypted — operator/debug only |
 | Knowledge UI / proxy | http://localhost:5001/knowledge | ingest, browse, search, RAG API (operator tool) |
 | Graphiti REST | http://localhost:8000/docs | knowledge ingestion and retrieval |
 | FalkorDB Browser | http://localhost:3001 | graph inspection |
@@ -81,7 +84,7 @@ Everything except Open WebUI is bound to `127.0.0.1` by default — these URLs w
 | Ollama | http://localhost:11434 | local LLM/embedding/vision backend |
 | OpenClaw | http://localhost:18799 | agent gateway (Codex → Claude Code → Ollama) |
 | Edge TTS | http://localhost:5050 | OpenAI-compatible text-to-speech |
-| Prometheus | http://localhost:9090 | metrics |
+| Prometheus | http://localhost:9090 | metrics + alert rules (`/alerts`) |
 | Grafana | http://localhost:3000 | dashboards (default login `admin` / `$GRAFANA_ADMIN_PASSWORD`) |
 
 ## Knowledge API
@@ -125,6 +128,8 @@ docker exec eedgeai-falkordb-1 redis-cli PING
 Graphiti groups replace Qdrant collections. A group is materialized on first ingest. Renaming groups is intentionally unsupported; deleting a group (or a single document within one) permanently removes its Graphiti episodes and facts — there is no archive/restore for either. The original file stays in MinIO either way, so a deleted document or group can be re-ingested from there if needed.
 
 A `backup` service snapshots FalkorDB and mirrors the MinIO `documents` bucket into `./backups` every `BACKUP_INTERVAL_SECONDS` (default 6h) — see [backup/README.md](backup/README.md) for what's covered, what isn't, and the restore procedure.
+
+`monitoring/alerts.yml` defines Prometheus alert rules (service down, FalkorDB unreachable, elevated LLM/ingest/search error rates) evaluated by the `prometheus` service — check firing alerts at http://localhost:9090/alerts. These are rules only, with no Alertmanager/notification channel wired up yet — see [docs/adr/0007-prometheus-alert-rules.md](docs/adr/0007-prometheus-alert-rules.md).
 
 ## Configuration
 

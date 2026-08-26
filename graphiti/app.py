@@ -76,23 +76,66 @@ def _default_for_annotation(annotation):
     return None
 
 
+def _sanitize_for_model(model_cls, data: dict, path: str, missing: list[str]) -> dict:
+    """Recursively default missing/None required fields for one response
+    model's raw (pre-validation) data, including nested list[BaseModel]
+    fields (e.g. ExtractedEdges.edges: list[Edge]).
+
+    Why recursive: patching a nested model's own __init__ (e.g. Edge)
+    does *not* help here — pydantic-core validates list[Edge] items
+    straight from the raw dicts via its compiled schema, never calling
+    Edge.__init__ for items nested inside an ExtractedEdges(**data) call.
+    The only place that can intervene is here, before the outer model's
+    own __init__ hands the (now-sanitized) data to pydantic. Verified
+    directly against graphiti-core==0.22.0: patching only the 9 top-level
+    models below, with no separate patch on Edge/NodeDuplicate/
+    ExtractedEntity, is sufficient — this function reaches into them.
+
+    Observed directly during validation, not just anticipated: a local
+    model returning `"source_entity_id": null` inside ExtractedEdges.edges
+    (present key, explicit None) crashed ingestion even though
+    ExtractedEdges was already in the patched-model list — the old
+    field-presence check (`if name in data: continue`) didn't treat an
+    explicit None on a required field as needing a default. Fixed here by
+    checking `data.get(name) is None` instead of just `name in data`.
+    """
+    data = dict(data)
+    for name, field in model_cls.model_fields.items():
+        annotation = field.annotation
+        args = get_args(annotation)
+        nested_model = (
+            args[0] if get_origin(annotation) is list and args
+            and isinstance(args[0], type) and issubclass(args[0], BaseModel)
+            else None
+        )
+        if nested_model is not None and isinstance(data.get(name), list):
+            data[name] = [
+                _sanitize_for_model(nested_model, item, f"{path}.{name}[{i}]", missing)
+                if isinstance(item, dict) else item
+                for i, item in enumerate(data[name])
+            ]
+        if field.is_required() and data.get(name) is None:
+            reason = "null" if name in data else "missing"
+            missing.append(f"{path}.{name} ({reason})")
+            data[name] = _FIELD_DEFAULT_OVERRIDES.get(
+                (model_cls, name), _default_for_annotation(annotation)
+            )
+    return data
+
+
 def _make_lenient(model_cls):
-    """Patch one graphiti-core response model in place so missing required
-    fields get a safe default instead of raising ValidationError."""
+    """Patch one graphiti-core response model in place so missing (or
+    explicitly null) required fields — including inside nested
+    list[BaseModel] fields — get a safe default instead of raising
+    ValidationError."""
     original_init = model_cls.__init__
 
     def _lenient_init(self, **data):
-        missing = []
-        for name, field in model_cls.model_fields.items():
-            if name in data or not field.is_required():
-                continue
-            missing.append(name)
-            data[name] = _FIELD_DEFAULT_OVERRIDES.get(
-                (model_cls, name), _default_for_annotation(field.annotation)
-            )
+        missing: list[str] = []
+        data = _sanitize_for_model(model_cls, data, model_cls.__name__, missing)
         if missing:
             _graphiti_hotfix_logger.warning(
-                "LLM response for %s missing required field(s) %s — "
+                "LLM response for %s missing/null required field(s) %s — "
                 "defaulting instead of failing the ingest.",
                 model_cls.__name__, missing,
             )
