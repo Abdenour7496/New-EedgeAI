@@ -179,11 +179,23 @@ def create_graphiti() -> Graphiti:
     embedding_model = os.getenv("EMBEDDING_MODEL_NAME", "nomic-embed-text")
     embedding_dim = int(os.getenv("EMBEDDING_DIM", "768"))
 
+    # LLM (entity/edge extraction, dedup) can be pointed somewhere different
+    # from embeddings — e.g. the openclaw gateway (Codex/Claude Code CLI
+    # subscriptions) instead of local Ollama. Verified directly: local
+    # qwen2.5:7b failed to finish extracting a real 6-message chat transcript
+    # inside a 1800s budget; the same call via openclaw took 8.8s. Embeddings
+    # stay on Ollama regardless — fast locally, and openclaw's gateway isn't
+    # an embeddings backend. Defaults to the same Ollama config as before if
+    # these aren't set, so this is opt-in. See docs/adr/0010-graphiti-openclaw-llm.md.
+    llm_api_key = os.getenv("GRAPHITI_LLM_API_KEY", api_key)
+    llm_base_url = os.getenv("GRAPHITI_LLM_BASE_URL", base_url)
+    llm_model = os.getenv("GRAPHITI_LLM_MODEL", model)
+
     llm_config = LLMConfig(
-        api_key=api_key,
-        model=model,
-        small_model=model,
-        base_url=base_url,
+        api_key=llm_api_key,
+        model=llm_model,
+        small_model=llm_model,
+        base_url=llm_base_url,
     )
     llm_client = OpenAIGenericClient(config=llm_config)
     embedder = OpenAIEmbedder(
