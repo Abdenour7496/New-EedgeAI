@@ -40,6 +40,16 @@ services:
       MODEL_NAME: ${GRAPHITI_MODEL:-qwen2.5:7b}
       EMBEDDING_MODEL_NAME: ${GRAPHITI_EMBEDDING_MODEL:-nomic-embed-text}
       EMBEDDING_DIM: ${GRAPHITI_EMBEDDING_DIM:-768}
+      # Entity/edge extraction routed separately from embeddings, through
+      # openclaw (Codex/Claude Code CLI subscriptions) by default — verified
+      # directly: local qwen2.5:7b extraction failed to finish a real
+      # 6-message chat transcript inside an 1800s budget; the same call via
+      # openclaw took 8.8s. Embeddings above stay on Ollama regardless
+      # (openclaw's gateway isn't an embeddings backend). See
+      # docs/adr/0010-graphiti-openclaw-llm.md.
+      GRAPHITI_LLM_BASE_URL: ${GRAPHITI_LLM_BASE_URL:-http://openclaw:18799/v1}
+      GRAPHITI_LLM_API_KEY: ${OPENCLAW_GATEWAY_TOKEN:-}
+      GRAPHITI_LLM_MODEL: ${GRAPHITI_LLM_MODEL:-openclaw}
       FALKORDB_HOST: falkordb
       FALKORDB_PORT: "6379"
       # Was missing here even though graphiti/app.py reads it (falkordb_driver
@@ -60,6 +70,8 @@ services:
       falkordb:
         condition: service_healthy
       ollama:
+        condition: service_healthy
+      openclaw:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthcheck')"]

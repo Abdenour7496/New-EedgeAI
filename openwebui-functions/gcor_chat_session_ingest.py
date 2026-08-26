@@ -60,6 +60,13 @@ class Filter:
             default=2,
             description="Skip ingesting a session until it has at least this many messages.",
         )
+        proxy_timeout_seconds: float = Field(
+            default_factory=lambda: float(os.environ.get("GRAPHITI_INGEST_TIMEOUT_SECONDS", "1800")),
+            description="How long to wait for the proxy's /api/ingest/session call, which blocks "
+                        "on synchronous Graphiti extraction. Defaults to the same "
+                        "GRAPHITI_INGEST_TIMEOUT_SECONDS env var the proxy itself uses, so this "
+                        "Function never gives up before the proxy would.",
+        )
         gcor_api_key: str = Field(
             default_factory=lambda: os.environ.get("GCOR_API_KEY", ""),
             description="Shared secret the GCOR proxy requires on /api/* (its GCOR_API_KEY). "
@@ -162,9 +169,16 @@ class Filter:
                 {"Authorization": f"Bearer {self.valves.gcor_api_key}"}
                 if self.valves.gcor_api_key else {}
             )
-            async with httpx.AsyncClient(timeout=60) as client:
+            # Graphiti extraction on a local model genuinely takes several
+            # minutes per episode (see docs/adr/0003) — the proxy itself
+            # waits up to GRAPHITI_INGEST_TIMEOUT_SECONDS (default 1800s)
+            # before giving up on it. A short client-side timeout here just
+            # means *we* give up first and log a ReadTimeout, even though
+            # the episode still lands a bit later. Match the proxy's budget.
+            async with httpx.AsyncClient(timeout=self.valves.proxy_timeout_seconds) as client:
                 ingest_resp = await client.post(
-                    self.valves.proxy_ingest_url, json=form, headers=proxy_headers, timeout=60,
+                    self.valves.proxy_ingest_url, json=form, headers=proxy_headers,
+                    timeout=self.valves.proxy_timeout_seconds,
                 )
                 ingest_resp.raise_for_status()
 
@@ -174,13 +188,27 @@ class Filter:
                 chat_id, len(messages), ingest_resp.json().get("document_id"),
             )
         except Exception as exc:
-            log.warning("[gcor_chat_session_ingest] failed for chat_id=%s: %s", chat_id, exc)
+            log.warning(
+                "[gcor_chat_session_ingest] failed for chat_id=%s: %s: %s",
+                chat_id, type(exc).__name__, exc,
+            )
 
 
 def _flatten_messages(chat: dict) -> list[dict]:
-    """Normalize OpenWebUI's stored chat.messages (list in newer versions,
-    id-keyed dict tree in older ones) into an ordered [{role, content}, ...]."""
-    raw = chat.get("messages")
+    """Normalize OpenWebUI's stored chat into an ordered [{role, content}, ...].
+
+    chat.history.messages (an id-keyed dict) is the authoritative, complete
+    conversation tree. chat.messages (a flat array) is NOT reliably kept in
+    sync with it — observed directly: after a real user/assistant exchange,
+    chat.messages held only the latest user turn (1 item) while
+    chat.history.messages had the full 6-message history. Prefer history;
+    fall back to the flat array only if history is missing (defensive, not
+    observed as a real case)."""
+    history = chat.get("history")
+    raw = history.get("messages") if isinstance(history, dict) else None
+    if not raw:
+        raw = chat.get("messages")
+
     items: list[dict]
     if isinstance(raw, list):
         items = raw
