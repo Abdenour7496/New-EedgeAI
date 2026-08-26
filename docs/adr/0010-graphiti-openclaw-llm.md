@@ -67,43 +67,80 @@ locally completed in **8.8 seconds** via openclaw.
   Embeddings are **not** moved — they're fast locally already, and
   openclaw's gateway is a chat-completions endpoint, not an embeddings
   backend.
-- `docker-compose.unified.yml`'s `graphiti` service now defaults
-  `GRAPHITI_LLM_BASE_URL` to `http://openclaw:18799/v1` and
-  `GRAPHITI_LLM_MODEL` to `openclaw`, authenticated with the existing
-  `OPENCLAW_GATEWAY_TOKEN`. `graphiti` now `depends_on: openclaw` (was only
-  `falkordb`/`ollama`) to avoid a cold-start race.
+- `GRAPHITI_LLM_BASE_URL` points at **the proxy's own
+  `/v1/openclaw/chat/completions`** (`http://proxy:5001/v1/openclaw`), not
+  at openclaw directly — see the "fallback resilience" addendum below for
+  why this changed from the initially-shipped version of this ADR.
+  Authenticated with `GCOR_API_KEY` (the proxy's own shared secret), not
+  `OPENCLAW_GATEWAY_TOKEN`.
+- `graphiti` depends on `falkordb`/`ollama`/`openclaw` being healthy at
+  startup (added `openclaw` here, wasn't previously required). It does
+  **not** `depends_on: proxy` — `proxy` already `depends_on: graphiti`, and
+  a mutual dependency isn't expressible in compose (nor needed): actual
+  extraction calls only happen through requests the already-running proxy
+  initiates, so proxy is guaranteed live by the time graphiti ever needs to
+  call back into it.
 - This only touches the `graphiti` service (this repo's own FastAPI
-  wrapper). `graphiti-mcp` (the separate vendor image
-  `zepai/knowledge-graph-mcp:standalone`, used for openclaw's own internal
-  memory-search MCP tool) is untouched — routing openclaw's own memory tool
-  back through openclaw itself would be circular, and it's not our code to
-  patch regardless.
+  wrapper) and `proxy` (one new route). `graphiti-mcp` (the separate vendor
+  image `zepai/knowledge-graph-mcp:standalone`, used for openclaw's own
+  internal memory-search MCP tool) is untouched — routing openclaw's own
+  memory tool back through openclaw itself would be circular, and it's not
+  our code to patch regardless.
 - The two `gcor_chat_session_ingest.py` bugs above are fixed in the repo
   Function source and were pushed into the already-running installation the
   same way ADR 0008's DB patch was: directly updating the row in OpenWebUI's
   `function` table, then recreating `openwebui`.
 
+## Addendum (same day): fallback resilience via the proxy, not direct-to-openclaw
+
+The version of this ADR first shipped pointed `GRAPHITI_LLM_BASE_URL`
+straight at `http://openclaw:18799/v1`. That worked (verified: 8.8s per
+extraction call) but had a real gap: the main chat pipeline's
+`call_openclaw()` (`proxy/main.py`) falls back to Ollama when openclaw's
+provider chain is exhausted or unreachable (5xx / timeout / network error);
+a direct connection from `graphiti-core`'s LLM client has no such fallback —
+an openclaw outage would simply fail every extraction call.
+
+Rather than reimplementing that fallback logic against `graphiti-core`'s
+client interface (real risk: `generate_response` mutates its `messages` list
+in place before calling the backend — retrying with a second client without
+copying the list first would double-append schema/language instructions to
+the prompt), added a **new proxy route**,
+`POST /v1/openclaw/chat/completions`, that is a raw passthrough to the
+existing, already-relied-upon `call_openclaw()` — same fallback behavior,
+zero duplicated logic. Deliberately **not** the existing
+`/v1/chat/completions` route: that one runs the full GCOR RAG pipeline
+(Graphiti search + prompt augmentation for end-user chat turns), which would
+corrupt a backend caller's own prompt (graphiti-core's extraction schema
+instructions) with irrelevant injected context — wrong tool for this job.
+
+Verified before and after switching:
+- New route in isolation: `200 OK`, `"FALLBACK_ENDPOINT_OK"`.
+- Existing `/v1/chat/completions` still works unchanged (regression check).
+- `graphiti-core`'s own client against the new route: **7.3s** (comparable
+  to the 8.8s direct-to-openclaw baseline — negligible added latency).
+- Full `/api/ingest/session` pipeline end-to-end through the new routing:
+  `200 OK` in 38.7s for a 2-message test session; cleaned up afterward.
+- The original failing real chat (`01e2882e-…`, 6 messages) had already been
+  confirmed archiving successfully (~5 min) against the direct-to-openclaw
+  version before this addendum's routing change — not re-run a second time
+  against the proxy-routed version, since the isolated client test above
+  already demonstrates equivalent-or-better latency through the new path.
+
 ## Consequences
 
-- Graphiti extraction/dedup calls now depend on `openclaw` being healthy and
-  its Codex/Claude Code CLI subscriptions being authenticated — previously
-  they only needed Ollama. If openclaw's provider chain is exhausted, note
-  it does **not** fall back to Ollama the way the main chat pipeline's
-  `call_openclaw()` does (`proxy/main.py`) — a Graphiti extraction call would
-  simply fail. Revisit if this turns out to matter in practice; the *README's
-  documented rationale for keeping Graphiti on Ollama* ("background
-  OpenAI-compatible API workloads, separate from the interactive Codex and
-  Claude Code runtimes") is superseded by this ADR for the LLM half only —
-  the README needs a corresponding update.
-- `SEMAPHORE_LIMIT` (default 2, caps concurrent Graphiti LLM calls) was not
-  changed. Worth revisiting now that each call is ~8s instead of minutes —
-  a higher limit may no longer risk overloading the backend the way it would
-  have against local Ollama.
-- Opt back out by setting `GRAPHITI_LLM_BASE_URL` back to Ollama's URL (or
-  the same value as `GRAPHITI_API_BASE_URL`) in `.env` — the code defaults
-  to the old Ollama-only behavior if these new env vars are never set.
-- Not yet re-verified: the original failing chat session (`01e2882e-…`)
-  successfully archiving end-to-end with openclaw wired in. The isolated
-  `graphiti-core` client call against openclaw was verified (8.8s, valid
-  structured JSON); the full `graphiti` service recreate + live retest is
-  the next step.
+- Graphiti extraction/dedup calls now depend on the `proxy` service (for
+  routing) and `openclaw` being healthy/authenticated. On openclaw failure,
+  they now fall back to Ollama automatically, same as the main chat
+  pipeline — this closes the gap the initial version of this ADR flagged.
+- `SEMAPHORE_LIMIT` raised from 2 to 4 (was sized for local Ollama calls
+  taking minutes each). Kept conservative rather than raised further —
+  openclaw's own concurrency headroom under real concurrent ingest load
+  hasn't been load-tested.
+- Opt back out entirely by setting `GRAPHITI_LLM_BASE_URL` back to Ollama's
+  URL (or the same value as `GRAPHITI_API_BASE_URL`) in `.env` — the code
+  defaults to the old Ollama-only behavior if these env vars are never set.
+- The *README's documented rationale for keeping Graphiti on Ollama*
+  ("background OpenAI-compatible API workloads, separate from the
+  interactive Codex and Claude Code runtimes") is superseded by this ADR
+  for the LLM half — updated alongside this fix.

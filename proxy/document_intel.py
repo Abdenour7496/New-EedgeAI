@@ -60,6 +60,7 @@ VISION_MODEL    = os.getenv("VISION_MODEL",
                             ANTHROPIC_MODEL if VISION_BACKEND == "anthropic" else "gpt-4o")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "llama3.2")
+OLLAMA_VISION_MODEL   = os.getenv("OLLAMA_VISION_MODEL", "llava:7b")
 OPENCLAW_BASE_URL      = os.getenv("OPENCLAW_BASE_URL",      "http://openclaw:18799/v1")
 OPENCLAW_GATEWAY_TOKEN = os.getenv("OPENCLAW_GATEWAY_TOKEN", "")
 MAX_TOKENS_TEXT = 2048
@@ -249,11 +250,16 @@ async def _vision(png_b64: str, prompt: str, max_tokens: int = MAX_TOKENS_VIS) -
             return r.json()["choices"][0]["message"]["content"].strip()
 
     if _vb == "ollama":
-        # Use Ollama vision-capable model (e.g. llava, llama3.2-vision)
+        # Use Ollama's vision-capable model — was using OLLAMA_MODEL
+        # (llama3.2, text-only) instead of OLLAMA_VISION_MODEL (llava:7b,
+        # already pulled locally per docker-compose.unified.yml's
+        # ollama-init). Never hit in practice while VISION_BACKEND
+        # defaulted elsewhere first, but would have silently misbehaved
+        # (non-vision model asked to describe an image) if ever selected.
         async with httpx.AsyncClient(timeout=120) as c:
             r = await c.post(
                 f"{OLLAMA_BASE_URL}/v1/chat/completions",
-                json={"model": OLLAMA_MODEL, "max_tokens": max_tokens,
+                json={"model": OLLAMA_VISION_MODEL, "max_tokens": max_tokens,
                       "messages": [{"role": "user", "content": [
                           {"type": "image_url", "image_url": {
                               "url": f"data:image/png;base64,{png_b64}"}},

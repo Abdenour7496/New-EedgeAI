@@ -41,14 +41,17 @@ services:
       EMBEDDING_MODEL_NAME: ${GRAPHITI_EMBEDDING_MODEL:-nomic-embed-text}
       EMBEDDING_DIM: ${GRAPHITI_EMBEDDING_DIM:-768}
       # Entity/edge extraction routed separately from embeddings, through
-      # openclaw (Codex/Claude Code CLI subscriptions) by default — verified
-      # directly: local qwen2.5:7b extraction failed to finish a real
-      # 6-message chat transcript inside an 1800s budget; the same call via
-      # openclaw took 8.8s. Embeddings above stay on Ollama regardless
-      # (openclaw's gateway isn't an embeddings backend). See
+      # the proxy's /v1/openclaw passthrough (openclaw's Codex/Claude Code
+      # CLI subscriptions, with the proxy's existing Ollama-on-failure
+      # fallback — NOT the full GCOR RAG pipeline, which would corrupt
+      # graphiti-core's own extraction prompts) — verified directly: local
+      # qwen2.5:7b extraction failed to finish a real 6-message chat
+      # transcript inside an 1800s budget; the same call via openclaw took
+      # 8.8s. Embeddings above stay on Ollama regardless (openclaw's
+      # gateway isn't an embeddings backend). See
       # docs/adr/0010-graphiti-openclaw-llm.md.
-      GRAPHITI_LLM_BASE_URL: ${GRAPHITI_LLM_BASE_URL:-http://openclaw:18799/v1}
-      GRAPHITI_LLM_API_KEY: ${OPENCLAW_GATEWAY_TOKEN:-}
+      GRAPHITI_LLM_BASE_URL: ${GRAPHITI_LLM_BASE_URL:-http://proxy:5001/v1/openclaw}
+      GRAPHITI_LLM_API_KEY: ${GCOR_API_KEY:-}
       GRAPHITI_LLM_MODEL: ${GRAPHITI_LLM_MODEL:-openclaw}
       FALKORDB_HOST: falkordb
       FALKORDB_PORT: "6379"
@@ -65,7 +68,13 @@ services:
       NEO4J_USER: unused
       NEO4J_PASSWORD: unused
       GRAPHITI_TELEMETRY_ENABLED: "false"
-      SEMAPHORE_LIMIT: ${GRAPHITI_SEMAPHORE_LIMIT:-2}
+      # Was 2, sized for local Ollama calls taking minutes each. Modest bump
+      # now that a typical extraction call via openclaw takes ~8s instead —
+      # kept conservative (not higher) since openclaw's own concurrency
+      # headroom (Codex/Claude Code CLI subscriptions) hasn't been load
+      # tested; raise further only after watching it hold up under real
+      # concurrent ingest load.
+      SEMAPHORE_LIMIT: ${GRAPHITI_SEMAPHORE_LIMIT:-4}
     depends_on:
       falkordb:
         condition: service_healthy

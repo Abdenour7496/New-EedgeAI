@@ -51,6 +51,14 @@ class Filter:
             default=False,
             description="Run full Document Intelligence (OCR, tables, entities) on attached files.",
         )
+        proxy_timeout_seconds: float = Field(
+            default_factory=lambda: float(os.environ.get("GRAPHITI_INGEST_TIMEOUT_SECONDS", "1800")),
+            description="How long to wait for the proxy's /api/ingest call, which blocks on "
+                        "synchronous Graphiti extraction. Defaults to the same "
+                        "GRAPHITI_INGEST_TIMEOUT_SECONDS env var the proxy itself uses (see "
+                        "docs/adr/0010), matching gcor_chat_session_ingest.py's same fix — "
+                        "was previously a hardcoded 300s, shorter than the proxy's own patience.",
+        )
         gcor_api_key: str = Field(
             default_factory=lambda: os.environ.get("GCOR_API_KEY", ""),
             description="Shared secret the GCOR proxy requires on /api/* (its GCOR_API_KEY). "
@@ -138,7 +146,7 @@ class Filter:
                     data=form,
                     files={"file": (filename, data)},
                     headers=proxy_headers,
-                    timeout=300,
+                    timeout=self.valves.proxy_timeout_seconds,
                 )
                 ingest_resp.raise_for_status()
                 log.info(
@@ -147,4 +155,7 @@ class Filter:
                 )
         except Exception as exc:
             self._ingested_ids.discard(file_id)
-            log.warning("[gcor_file_ingest] failed to ingest %s (file_id=%s): %s", filename, file_id, exc)
+            log.warning(
+                "[gcor_file_ingest] failed to ingest %s (file_id=%s): %s: %s",
+                filename, file_id, type(exc).__name__, exc,
+            )
