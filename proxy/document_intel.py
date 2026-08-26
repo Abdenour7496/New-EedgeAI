@@ -23,9 +23,13 @@ Env vars
   DOCINT_VISION         1/0  — enable vision-based table+form extraction (default 1)
   DOCINT_MAX_PAGES      max pages to OCR/render for vision (default 10)
   VISION_MAX_PX         max pixel side for rendered pages (default 1024)
-  OPENAI_API_KEY        needed for chat + vision
+  OPENAI_API_KEY        needed for chat + vision when LLM_BACKEND=openai
   ANTHROPIC_API_KEY     used when LLM_BACKEND=anthropic
-  LLM_BACKEND           openai|anthropic (default openai)
+  LLM_BACKEND           openai|anthropic|ollama|openclaw (default openai)
+  VISION_BACKEND        same options, overrides LLM_BACKEND for vision calls only
+  OPENCLAW_BASE_URL     used when LLM_BACKEND/VISION_BACKEND=openclaw — routes
+                        through Codex/Claude Code CLI subscriptions instead of
+                        a pay-per-token API key
 """
 
 from __future__ import annotations
@@ -56,6 +60,8 @@ VISION_MODEL    = os.getenv("VISION_MODEL",
                             ANTHROPIC_MODEL if VISION_BACKEND == "anthropic" else "gpt-4o")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "llama3.2")
+OPENCLAW_BASE_URL      = os.getenv("OPENCLAW_BASE_URL",      "http://openclaw:18799/v1")
+OPENCLAW_GATEWAY_TOKEN = os.getenv("OPENCLAW_GATEWAY_TOKEN", "")
 MAX_TOKENS_TEXT = 2048
 MAX_TOKENS_VIS  = 1500
 
@@ -169,6 +175,22 @@ class DocIntelResult:
 
 async def _chat(messages: list[dict], max_tokens: int = MAX_TOKENS_TEXT) -> str:
     """Call the configured LLM with text-only messages."""
+    if LLM_BACKEND == "openclaw":
+        # Routes through the openclaw gateway's Codex/Claude Code CLI
+        # subscriptions instead of a pay-per-token API key — see
+        # docs/adr for why (both OpenAI and Anthropic accounts were out
+        # of credit as of 2026-08-26). Same endpoint/shape main.py's
+        # call_openclaw() uses for the primary chat pipeline.
+        async with httpx.AsyncClient(timeout=120) as c:
+            r = await c.post(
+                f"{OPENCLAW_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {OPENCLAW_GATEWAY_TOKEN}",
+                         "Content-Type": "application/json"},
+                json={"model": "openclaw", "max_tokens": max_tokens, "messages": messages},
+            )
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"].strip()
+
     if LLM_BACKEND == "ollama":
         async with httpx.AsyncClient(timeout=120) as c:
             r = await c.post(
@@ -207,6 +229,24 @@ async def _chat(messages: list[dict], max_tokens: int = MAX_TOKENS_TEXT) -> str:
 async def _vision(png_b64: str, prompt: str, max_tokens: int = MAX_TOKENS_VIS) -> str:
     """Call the vision model with a PNG image (base64) and a text prompt."""
     _vb = VISION_BACKEND   # respects VISION_BACKEND env, falls back to LLM_BACKEND
+
+    if _vb == "openclaw":
+        # Same subscription-backed gateway as _chat() above — the
+        # underlying Codex/Claude Code CLI runtimes handle image input.
+        async with httpx.AsyncClient(timeout=120) as c:
+            r = await c.post(
+                f"{OPENCLAW_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {OPENCLAW_GATEWAY_TOKEN}",
+                         "Content-Type": "application/json"},
+                json={"model": "openclaw", "max_tokens": max_tokens,
+                      "messages": [{"role": "user", "content": [
+                          {"type": "image_url", "image_url": {
+                              "url": f"data:image/png;base64,{png_b64}"}},
+                          {"type": "text", "text": prompt},
+                      ]}]},
+            )
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"].strip()
 
     if _vb == "ollama":
         # Use Ollama vision-capable model (e.g. llava, llama3.2-vision)

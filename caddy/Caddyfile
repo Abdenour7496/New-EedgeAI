@@ -1,0 +1,24 @@
+# TLS front door for OpenWebUI — see docs/adr/0006-tls-reverse-proxy.md.
+#
+# `tls internal` makes Caddy mint and manage its own local CA + leaf certs
+# (persisted in the caddy_data volume across restarts) instead of requesting
+# one from a public CA — no domain name or internet-reachable port 80/443
+# required, which fits a LAN/dev deployment. Browsers will show a one-time
+# untrusted-certificate warning until that CA is trusted, or you replace this
+# block with a real certificate — see the ADR for both.
+#
+# `on_demand` is required, not cosmetic: this site block has no static
+# hostname (it's reached by whatever IP or name the client used — localhost
+# via a tunnel, a LAN IP, a real hostname), and without `on_demand` Caddy
+# never actually issues a certificate for an address it wasn't told about
+# upfront — every handshake fails with a generic "internal error" TLS alert.
+# `on_demand` mints one on the fly for whatever SNI shows up, safe here
+# because the internal CA has no external rate limit to exhaust. Verified
+# against both an IP-literal and a hostname client (see the ADR).
+:8443 {
+	tls internal {
+		on_demand
+	}
+
+	reverse_proxy openwebui:8080
+}

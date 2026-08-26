@@ -1,0 +1,83 @@
+# Prometheus alert rules for the eedgeai stack. Rules-only (no Alertmanager) —
+# firing alerts show in Prometheus (http://localhost:9090/alerts) and Grafana
+# (which can query the `ALERTS` metric this Prometheus already exposes), but
+# nothing pages anyone yet. See docs/adr/0007-prometheus-alert-rules.md.
+
+groups:
+  - name: eedgeai-service-health
+    rules:
+      - alert: ServiceDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} is down"
+          description: >-
+            Prometheus has not been able to scrape {{ $labels.job }}
+            ({{ $labels.instance }}) for 2 minutes.
+
+      - alert: FalkorDBDown
+        expr: redis_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "FalkorDB (graph/vector store) is unreachable"
+          description: >-
+            falkordb-exporter reports redis_up == 0 for 2m. Graphiti
+            ingestion and retrieval cannot function without FalkorDB.
+
+  - name: eedgeai-proxy
+    rules:
+      - alert: ProxyLLMErrorRateHigh
+        expr: >-
+          sum(rate(gcor_llm_requests_total{status=~"error|exception"}[10m]))
+            /
+          sum(rate(gcor_llm_requests_total[10m])) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High LLM call failure rate on the proxy"
+          description: >-
+            Over 20% of gcor_llm_requests_total calls have status
+            error/exception over the last 10m (currently
+            {{ $value | humanizePercentage }}). Check
+            `docker compose logs proxy openclaw`.
+
+      - alert: ProxyIngestFailing
+        expr: sum(rate(gcor_ingest_total{status="graphiti_error"}[15m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Document ingests are failing on the proxy"
+          description: >-
+            gcor_ingest_total{status="graphiti_error"} has been incrementing
+            for 10m+ — check `docker compose logs proxy graphiti`.
+
+  - name: eedgeai-graphiti
+    rules:
+      - alert: GraphitiIngestFailing
+        expr: sum(rate(graphiti_ingest_requests_total{status="error"}[15m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Graphiti ingestion requests are failing"
+          description: >-
+            graphiti_ingest_requests_total{status="error"} has been
+            incrementing for 10m+ — see the graphiti_hotfix note in the
+            README if this correlates with malformed-JSON warnings.
+
+      - alert: GraphitiSearchFailing
+        expr: sum(rate(graphiti_search_requests_total{status="error"}[15m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Graphiti search requests are failing"
+          description: >-
+            graphiti_search_requests_total{status="error"} has been
+            incrementing for 10m+ — RAG retrieval is degraded stack-wide.

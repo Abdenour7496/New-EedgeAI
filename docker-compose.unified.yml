@@ -443,12 +443,13 @@ services:
   # ── OpenWebUI ─────────────────────────────────────────────────────────────────
 
   openwebui:
-    image: ghcr.io/open-webui/open-webui:v0.11.0
-    # The one port meant for end users (see docs/adr/0002-proxy-api-authentication.md).
-    # Put a real TLS-terminating reverse proxy in front of this for anything
-    # beyond a trusted LAN — this compose file does not provide one.
+    image: ghcr.io/open-webui/open-webui:v0.11.1
+    # No longer the public port — `caddy` below is now the TLS front door end
+    # users hit (see docs/adr/0006-tls-reverse-proxy.md). Bound to localhost
+    # only, same as every other admin/operator surface in this stack; reach
+    # it directly via SSH tunnel / kubectl port-forward for debugging.
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
       # Persistent signing key for session/JWT auth — without this OpenWebUI
       # generates a random one on every restart, invalidating every logged-in
@@ -456,7 +457,7 @@ services:
       WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:-changeme-set-a-real-secret}
       # Closed after the first admin account is created. OpenWebUI allows the
       # very first signup regardless of this setting so there's always a way
-      # to bootstrap an admin; verify this against the pinned v0.11.0 behavior
+      # to bootstrap an admin; verify this against the pinned v0.11.1 behavior
       # before relying on it in production.
       ENABLE_SIGNUP: ${OPENWEBUI_ENABLE_SIGNUP:-false}
       # Also readable directly by the gcor_* Functions' Python code (they run
@@ -470,6 +471,15 @@ services:
       RAG_EMBEDDING_ENGINE: openai
       RAG_OPENAI_API_BASE_URL: http://proxy:5001/v1
       RAG_OPENAI_API_KEY: ${GCOR_API_KEY:-openclaw}
+      # Without this, OpenWebUI's own embedding_engine=openai still keeps its
+      # stock local model id (sentence-transformers/all-MiniLM-L6-v2), which
+      # doesn't exist in Ollama — the proxy forwards that name straight
+      # through (EMBEDDING_BACKEND=ollama) and Ollama 404s. That breaks
+      # OpenWebUI's native "attach a file to chat, ask about it" RAG flow
+      # silently (the model reports nothing was attached) — see
+      # docs/adr/0008-openwebui-embedding-model-mismatch.md. Must match
+      # OLLAMA_EMBEDDING_MODEL below / on the proxy.
+      RAG_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}
       ENABLE_RAG_LOCAL_WEB_FETCH: "false"
       # Ollama — fallback model when Anthropic is unavailable
       OLLAMA_BASE_URL: http://ollama:11434
@@ -509,6 +519,36 @@ services:
           cpus: "2"
           memory: 2g
 
+  # ── TLS reverse proxy ─────────────────────────────────────────────────────────
+  # The one port meant for end users (see docs/adr/0002-proxy-api-authentication.md
+  # and docs/adr/0006-tls-reverse-proxy.md). Terminates TLS with a Caddy-managed
+  # self-signed cert so nothing crosses the LAN in plaintext, even before you
+  # have a real certificate — see the ADR for swapping one in.
+
+  caddy:
+    image: caddy:2.8-alpine
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      openwebui:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "--no-check-certificate", "--spider", "-q", "https://127.0.0.1:8443/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256m
+
   # ── Monitoring ────────────────────────────────────────────────────────────────
 
   falkordb-exporter:
@@ -525,6 +565,7 @@ services:
     image: prom/prometheus
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml
     ports:
       - "127.0.0.1:9090:9090"
     depends_on:
@@ -600,3 +641,5 @@ volumes:
   openwebui_data:
   ollama_data:
   docs_minio_data:
+  caddy_data:
+  caddy_config:
