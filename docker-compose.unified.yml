@@ -61,6 +61,14 @@ services:
       # since only falkordb/graphiti-mcp/falkordb-exporter received it.
       FALKORDB_PASSWORD: ${FALKORDB_PASSWORD:-}
       FALKORDB_DATABASE: ${FALKORDB_DATABASE:-eedgeai}
+      # Documented in .env.example as overridable, but was never actually
+      # wired through here — Compose does not pass an arbitrary .env value
+      # into a container unless the service's own environment: block
+      # references it. Without this, setting these in .env would have had
+      # no effect at all. See docs/adr/0016 and 0017.
+      FALKORDB_HEALTH_CHECK_INTERVAL_SECONDS: ${FALKORDB_HEALTH_CHECK_INTERVAL_SECONDS:-30}
+      FALKORDB_SOCKET_TIMEOUT_SECONDS: ${FALKORDB_SOCKET_TIMEOUT_SECONDS:-30}
+      SEARCH_RESTART_INTERVAL_SECONDS: ${SEARCH_RESTART_INTERVAL_SECONDS:-900}
       db_backend: falkordb
       # Graphiti 0.22.0 marks these optional fields as required during settings
       # validation even for DB_BACKEND=falkordb. They are never connected to.

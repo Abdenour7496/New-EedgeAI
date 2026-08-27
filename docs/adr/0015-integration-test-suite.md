@@ -107,6 +107,11 @@ findings deep); the corresponding test asserts only what's reliably true
 (ingest creates an episode + fact) rather than asserting on search
 ranking that isn't yet understood. Worth its own dedicated look.
 
+**Update:** got that dedicated look — see
+[docs/adr/0016-falkordb-connection-health.md](0016-falkordb-connection-health.md).
+Root cause traced to the long-lived FalkorDB connection, not search logic
+or ranking at all.
+
 ## Consequences
 
 - Anyone running this stack before this fix has orphaned edges sitting in

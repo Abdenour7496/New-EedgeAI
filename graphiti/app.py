@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import time
@@ -11,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from graphiti_core import Graphiti
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
+from falkordb.asyncio import FalkorDB
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 from graphiti_core.edges import EntityEdge
@@ -48,6 +50,7 @@ from graphiti_core.prompts.summarize_nodes import Summary, SummaryDescription
 # those are runtime-supplied classes, not statically enumerable here. This
 # repo doesn't configure custom entity/edge types by default.
 _graphiti_hotfix_logger = logging.getLogger("graphiti_hotfix")
+logger = logging.getLogger(__name__)
 
 # Per-field overrides where the field's own docstring names a specific
 # fallback more precise than the generic type-based default below.
@@ -207,10 +210,29 @@ def create_graphiti() -> Graphiti:
         )
     )
     reranker = OpenAIRerankerClient(client=llm_client, config=llm_config)
-    driver = FalkorDriver(
+    # FalkorDriver constructs its own falkordb.asyncio.FalkorDB client with
+    # every connection-pool tuning knob left at library defaults —
+    # including health_check_interval=0 (disabled). Found directly: after
+    # this container ran for a while under real ingest/search load, fresh
+    # content stopped being found by /search (proven correct in isolation —
+    # a brand-new Graphiti instance against the same FalkorDB found it
+    # immediately), while a container restart fixed it instantly. That
+    # points at a connection in the pool going stale and never being
+    # detected/replaced, since nothing was ever checking it. Constructing
+    # our own client with health checking enabled and reasonable timeouts,
+    # then handing it to FalkorDriver via falkor_db= (it uses a
+    # caller-provided client as-is instead of building its own) — see
+    # docs/adr/0016-falkordb-connection-health.md.
+    falkor_client = FalkorDB(
         host=os.getenv("FALKORDB_HOST", "falkordb"),
         port=int(os.getenv("FALKORDB_PORT", "6379")),
         password=os.getenv("FALKORDB_PASSWORD") or None,
+        health_check_interval=int(os.getenv("FALKORDB_HEALTH_CHECK_INTERVAL_SECONDS", "30")),
+        socket_timeout=int(os.getenv("FALKORDB_SOCKET_TIMEOUT_SECONDS", "30")),
+        socket_keepalive=True,
+    )
+    driver = FalkorDriver(
+        falkor_db=falkor_client,
         database=os.getenv("FALKORDB_DATABASE", "eedgeai"),
     )
     return Graphiti(
@@ -221,11 +243,49 @@ def create_graphiti() -> Graphiti:
     )
 
 
+SEARCH_RESTART_INTERVAL_SECONDS = int(os.getenv("SEARCH_RESTART_INTERVAL_SECONDS", str(15 * 60)))
+
+
+async def _periodic_self_restart():
+    """Mitigation, not a fix, for docs/adr/0017: /search on this app's
+    long-lived instance intermittently — and sometimes not so
+    intermittently — stopped finding recently-written facts, confirmed
+    correct at every other layer (embedding, storage, the raw Cypher
+    queries, RRF fusion). Every fix attempted in-process (a fresh Graphiti
+    instance per search call, an isolated thread with its own event loop)
+    failed to reliably resolve it; only a genuinely separate OS process
+    ever did, consistently, in every test. A full container restart is
+    the cheapest way to get that same isolation for the app's primary
+    instance too — it's fast (health check passes in well under a
+    minute) and loses no data (FalkorDB is a separate service on its own
+    volume). This trades a small, bounded, and known outage window for an
+    unbounded, unpredictable one — the actual bug still needs a proper
+    upstream fix or root-cause (likely in graphiti-core's or falkordb-py's
+    async client under concurrent load); this just keeps the symptom's
+    damage contained in the meantime. Set
+    SEARCH_RESTART_INTERVAL_SECONDS=0 to disable.
+    """
+    if SEARCH_RESTART_INTERVAL_SECONDS <= 0:
+        return
+    await asyncio.sleep(SEARCH_RESTART_INTERVAL_SECONDS)
+    logger.warning(
+        "Restarting after %ds uptime (SEARCH_RESTART_INTERVAL_SECONDS) — "
+        "see docs/adr/0017-search-connection-workaround.md.",
+        SEARCH_RESTART_INTERVAL_SECONDS,
+    )
+    # os._exit, not sys.exit or a graceful shutdown request: this needs to
+    # actually terminate the process (so `restart: unless-stopped` brings
+    # up a genuinely fresh one) even if something else is hung.
+    os._exit(0)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.graphiti = create_graphiti()
     await app.state.graphiti.build_indices_and_constraints()
+    restart_task = asyncio.create_task(_periodic_self_restart())
     yield
+    restart_task.cancel()
     await app.state.graphiti.close()
 
 
@@ -289,6 +349,15 @@ async def add_messages(request: AddMessagesRequest):
 
 @app.post("/search")
 async def search(request: SearchQuery):
+    # NOTE: tried several in-process fixes for a real, confirmed bug here
+    # (fresh Graphiti instance per call; an isolated thread with its own
+    # event loop) — neither reliably worked. Only a genuinely separate OS
+    # process ever reliably found recently-written facts in testing. See
+    # docs/adr/0017-search-connection-workaround.md for the full
+    # investigation and why this reverted to the original simple form
+    # rather than keep unproven complexity that added overhead for no
+    # measured benefit. Mitigated instead via a scheduled self-restart
+    # (main() below) that bounds how long any staleness window can last.
     started = time.perf_counter()
     try:
         edges = await app.state.graphiti.search(

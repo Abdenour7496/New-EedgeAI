@@ -25,24 +25,23 @@ class TestIngestAndRetrieve(unittest.TestCase):
             helpers.cleanup_episode(self.client, collection, episode_uuid)
         self.client.close()
 
-    def test_ingest_creates_an_episode(self):
-        """The reliably-verified half of "ingest then find it": the proxy
-        accepts the file, extracts it, and creates a Graphiti episode +
-        at least one derived fact. Confirmed a real edge object exists via
-        test_delete_removes_the_facts_not_just_the_episode's direct check
-        (delete finds and removes it) — that's the trustworthy signal.
+    def test_ingest_then_search_finds_it(self):
+        """Ingest a document, find it again by searching for its actual
+        content — the most basic promise this stack makes.
 
-        Deliberately NOT asserting the fact then appears in /api/search
-        results here. Found directly while building this suite: even
-        Graphiti's own raw /search endpoint did not surface a freshly
-        ingested fact for an on-topic query, immediately or after retrying
-        with backoff — while the *edge itself* was independently confirmed
-        to exist (delete_episode found and removed exactly one). That gap
-        — an edge existing but not being retrievable via hybrid search —
-        looks like a real, separate issue (embedding/indexing timing, or
-        hybrid-search ranking against a now-populated real graph) worth
-        its own investigation, not something to paper over with a flaky
-        or overly-patient test here."""
+        NOT reliably guaranteed to pass right now — see
+        docs/adr/0017-search-connection-workaround.md. A real bug in
+        Graphiti's long-lived FalkorDB connection intermittently hides
+        recent writes from /search; every in-process fix attempted
+        (health-checking the connection, a fresh instance per call, an
+        isolated event loop per call) failed to reliably resolve it, only
+        a genuinely separate OS process ever did. Mitigated with a
+        scheduled self-restart (bounds the staleness window, doesn't
+        eliminate it) rather than left unfixed. This test may occasionally
+        fail depending on where in that restart cycle graphiti currently
+        is — that's an honest reflection of current reliability, not
+        flakiness in the test itself. Not part of the CI gate for exactly
+        this reason (see test_openwebui_stream_smoke.py's same category)."""
         title = helpers.unique_name("basic-ingest")
         payload = b"The quarterly revenue for Northwind Traders in Q4 2026 was 7.8 million dollars."
         resp = self.client.post(
@@ -59,6 +58,15 @@ class TestIngestAndRetrieve(unittest.TestCase):
         episode_uuid = helpers.find_episode_uuid(self.client, "documents", title)
         self.assertIsNotNone(episode_uuid, "ingested episode not found in Graphiti's recent list")
         self._cleanup.append(("documents", episode_uuid))
+
+        results = helpers.search_until(
+            self.client, "documents", "Northwind Traders quarterly revenue",
+            predicate=lambda rs: any("Northwind" in r.get("text", "") or "7.8" in r.get("text", "") for r in rs),
+        )
+        self.assertTrue(
+            any("Northwind" in r.get("text", "") or "7.8" in r.get("text", "") for r in results),
+            f"expected the ingested fact in search results, got: {results[:3]}",
+        )
 
     def test_duplicate_submission_does_not_create_a_second_episode(self):
         """Regression test for docs/adr/0012: a caller retrying identical
