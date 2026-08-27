@@ -21,11 +21,10 @@ class Filter:
     """Archive the full chat session transcript into the GCOR knowledge pipeline.
 
     Companion to gcor_file_ingest.py, which handles files attached to a chat
-    message. This filter handles the conversation itself: on every outlet
-    (i.e. after each assistant turn finishes), it fetches the chat's current
-    title + full message history back from OpenWebUI's own chat API and
-    forwards it to the GCOR proxy's /api/ingest/session. That endpoint writes
-    a JSON snapshot of the transcript to MinIO under
+    message. This filter handles the conversation itself: it fetches the
+    chat's current title + full message history back from OpenWebUI's own
+    chat API and forwards it to the GCOR proxy's /api/ingest/session. That
+    endpoint writes a JSON snapshot of the transcript to MinIO under
     chat-sessions/<session_id>/<date-time>_<name>.json — named with the real
     chat title once OpenWebUI has generated one, or a snippet of the first
     user message before that (OpenWebUI's placeholder title, e.g. "New Chat",
@@ -33,11 +32,19 @@ class Filter:
     chat_sessions by default), so past conversations become retrievable —
     not just uploaded documents.
 
-    Ingestion runs in the background (fire-and-forget) so it never delays the
-    chat response; failures are logged, not surfaced to the user. A session
-    accumulates one snapshot object per assistant turn — that's intentional:
-    it gives a timestamped history of how the conversation grew, not just its
-    final state.
+    Debounced, not fired on every turn: each snapshot re-sends the FULL
+    transcript (not a diff), so archiving after every single assistant turn
+    would re-run full extraction over the whole growing conversation every
+    time — wasted, redundant work that also stacks concurrent extraction
+    jobs for the same chat under active back-and-forth use. Instead, every
+    outlet (re)starts a debounce_seconds timer for that chat_id, cancelling
+    any timer already pending for it; the transcript only actually archives
+    once the conversation goes quiet for that long. A guard also skips
+    starting a new archive if one is already in flight for that chat_id
+    (e.g. a slow extraction from an earlier quiet period still running).
+
+    Ingestion runs in the background (fire-and-forget) so it never delays
+    the chat response; failures are logged, not surfaced to the user.
     """
 
     class Valves(BaseModel):
@@ -60,6 +67,13 @@ class Filter:
             default=2,
             description="Skip ingesting a session until it has at least this many messages.",
         )
+        debounce_seconds: float = Field(
+            default=60.0,
+            description="Wait for this many seconds of quiet on a chat before archiving it — "
+                        "each new assistant turn resets the timer for that chat. Coalesces a "
+                        "burst of back-and-forth turns into one archive call instead of "
+                        "re-extracting the whole growing transcript after every single turn.",
+        )
         proxy_timeout_seconds: float = Field(
             default_factory=lambda: float(os.environ.get("GRAPHITI_INGEST_TIMEOUT_SECONDS", "1800")),
             description="How long to wait for the proxy's /api/ingest/session call, which blocks "
@@ -81,6 +95,14 @@ class Filter:
         # again on an unchanged conversation doesn't write a duplicate snapshot.
         self._last_hash: dict[str, str] = {}
         self._tasks: set[asyncio.Task] = set()
+        # chat_id -> its currently-pending debounce timer task, so a new
+        # turn can cancel and replace it rather than stacking another one.
+        self._debounce_tasks: dict[str, asyncio.Task] = {}
+        # chat_ids with an archive actively in flight right now (past the
+        # debounce wait, mid-extraction) — belt-and-suspenders against a
+        # slow archive from an earlier quiet period still running when a
+        # new one would otherwise start.
+        self._in_flight: set[str] = set()
 
     async def outlet(
         self,
@@ -106,13 +128,51 @@ class Filter:
             auth_header = __request__.headers.get("authorization")
             cookie_header = __request__.headers.get("cookie")
 
+        if chat_id in self._in_flight:
+            # An archive for this chat is already past its debounce wait
+            # and actively running — let it finish rather than cancelling
+            # it (a task in _debounce_tasks is ONLY ever still in its
+            # debounce sleep, never mid-archive; checking _in_flight first,
+            # before touching _debounce_tasks at all, keeps that invariant
+            # true and avoids a race — verified directly: without this
+            # ordering, a turn arriving mid-archive cancelled the in-flight
+            # task itself via the "supersede" logic below, its finally:
+            # cleared _in_flight, and a second archive started concurrently).
+            # The next turn after this one finishes will debounce normally.
+            return body
+
+        # A new turn on this chat supersedes any debounce timer still
+        # waiting to fire — restart the quiet-period clock instead of
+        # letting both eventually archive.
+        pending = self._debounce_tasks.get(chat_id)
+        if pending is not None and not pending.done():
+            pending.cancel()
+
         task = asyncio.create_task(
-            self._ingest_session(chat_id, auth_header, cookie_header)
+            self._debounced_ingest(chat_id, auth_header, cookie_header)
         )
+        self._debounce_tasks[chat_id] = task
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
         return body
+
+    async def _debounced_ingest(
+        self,
+        chat_id: str,
+        auth_header: Optional[str],
+        cookie_header: Optional[str],
+    ) -> None:
+        try:
+            await asyncio.sleep(self.valves.debounce_seconds)
+        except asyncio.CancelledError:
+            return  # a newer turn on this chat superseded this timer
+
+        self._in_flight.add(chat_id)
+        try:
+            await self._ingest_session(chat_id, auth_header, cookie_header)
+        finally:
+            self._in_flight.discard(chat_id)
 
     async def _ingest_session(
         self,

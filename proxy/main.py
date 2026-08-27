@@ -1523,6 +1523,22 @@ async def chat_completions(request: Request):
     return await _run_chat_completion(body, rag_collection)
 
 
+@app.post("/v1/openclaw/chat/completions")
+async def openclaw_chat_completions_raw(request: Request):
+    """Raw passthrough to openclaw, with its existing Ollama-on-failure
+    fallback (call_openclaw already falls back on 5xx/timeout/network
+    error) — but WITHOUT /v1/chat/completions' GCOR context-injection
+    pipeline (Graphiti search + prompt augmentation), which would corrupt
+    a caller's own carefully-built prompt (e.g. graphiti-core's own
+    entity/edge extraction schema instructions). For backend workloads
+    that want openclaw's speed with Ollama resilience, not the GCOR
+    RAG behavior meant for end-user chat turns. See
+    docs/adr/0010-graphiti-openclaw-llm.md.
+    """
+    body = await request.json()
+    return await call_openclaw(body)
+
+
 # ── Buzz bridge ──────────────────────────────────────────────────────────────
 # In-process sliding-window limiter — the Buzz bridge is a single trusted
 # caller, this just bounds cost/blast-radius if its token ever leaks or the

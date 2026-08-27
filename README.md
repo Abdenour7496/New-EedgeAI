@@ -2,7 +2,7 @@
 
 EedgeAI is a local-first agent and retrieval stack. Graphiti provides temporal knowledge extraction and hybrid retrieval, FalkorDB stores the graph and vectors, OpenClaw provides agent tools, Open WebUI provides chat, and MinIO preserves original documents and chat-session transcripts.
 
-Conversational agents use OpenAI Codex first, Claude Code second, and local Ollama as the final fallback. Graphiti extraction and embeddings remain on Ollama by default because they are background OpenAI-compatible API workloads, separate from the interactive Codex and Claude Code runtimes.
+Conversational agents use OpenAI Codex first, Claude Code second, and local Ollama as the final fallback. Graphiti's entity/edge extraction uses the same openclaw-backed fallback chain by default (routed through the proxy's `/v1/openclaw` passthrough, not directly — see [docs/adr/0010-graphiti-openclaw-llm.md](docs/adr/0010-graphiti-openclaw-llm.md)): local `qwen2.5:7b` extraction reliably takes 30+ minutes on a real multi-message document or chat transcript, while the same call via openclaw takes single-digit seconds. Only embeddings stay on Ollama by default — they're fast locally, and openclaw's gateway isn't an embeddings backend. Point `GRAPHITI_LLM_BASE_URL` back at Ollama in `.env` to opt out.
 
 ## Current architecture
 
@@ -33,7 +33,7 @@ Graphiti officially supports FalkorDB and combines graph traversal, semantic sim
 
 The material constraint is extraction quality: Graphiti requires an LLM that reliably returns structured JSON. The default local model is `qwen2.5:7b`; smaller local models were not reliable enough in validation. Allocate at least 12 GB RAM to Docker (16 GB recommended). For better extraction quality, point `GRAPHITI_API_BASE_URL`, `GRAPHITI_API_KEY`, and `GRAPHITI_MODEL` at an OpenAI-compatible hosted model.
 
-CPU-only local extraction is also slow — several minutes per ingest call is normal, since each chunk is a sequential LLM call inside Graphiti. `/api/ingest`, `/api/ingest/session`, and the OpenWebUI ingest Functions all wait synchronously for that to finish; the proxy's `GRAPHITI_INGEST_TIMEOUT_SECONDS` (default 1800s) caps how long they'll wait before returning an error, even though the episode may still land a bit later. A hosted model needs far less margin.
+CPU-only local extraction is also slow — several minutes per ingest call was the norm before entity/edge extraction was moved to route through openclaw by default (see [docs/adr/0010-graphiti-openclaw-llm.md](docs/adr/0010-graphiti-openclaw-llm.md)); a typical call now takes single-digit seconds. `/api/ingest`, `/api/ingest/session`, and the OpenWebUI ingest Functions all wait synchronously for extraction to finish; the proxy's `GRAPHITI_INGEST_TIMEOUT_SECONDS` (default 1800s) caps how long they'll wait before returning an error, even though the episode may still land a bit later. Point `GRAPHITI_LLM_BASE_URL` back at Ollama in `.env` to opt back into local-only extraction — expect that original slowness to return if you do.
 
 A local model can also return incomplete or malformed structured JSON for one of Graphiti's internal extraction steps (missing required fields, or occasionally echoing the JSON schema itself instead of data), which graphiti-core doesn't tolerate by default. `graphiti/app.py` patches this at startup across every affected response model so a partial response degrades to safe defaults instead of failing the whole ingest — see [docs/adr/0003-graphiti-edgeduplicate-hotfix.md](docs/adr/0003-graphiti-edgeduplicate-hotfix.md). A rising rate of its warning logs (`docker compose logs graphiti | grep graphiti_hotfix`) is a real signal the configured model is unreliable and worth upgrading.
 
@@ -105,9 +105,11 @@ Files attached during an Open WebUI chat, and the chat session itself, are captu
 | Function | Captures | Stored at | Indexed into |
 |---|---|---|---|
 | `gcor_file_ingest.py` | files attached to a chat message | `documents/originals/<doc_id>/<filename>` | Graphiti group `documents` (or the workspace's selected group) |
-| `gcor_chat_session_ingest.py` | the conversation itself, after every assistant turn | `documents/chat-sessions/<session_id>/<date-time>_<meaningful-name>.json` | Graphiti group `chat_sessions` |
+| `gcor_chat_session_ingest.py` | the conversation itself, debounced (see below) | `documents/chat-sessions/<session_id>/<date-time>_<meaningful-name>.json` | Graphiti group `chat_sessions` |
 
 Chat-session naming: the folder is keyed by the chat's stable `session_id`, so a conversation's snapshots stay together for its whole life even as Open WebUI's own title changes. Each snapshot's filename carries the date, time, and the best human-readable name available at that moment — the real chat title once Open WebUI has generated one, otherwise a snippet of the first user message (Open WebUI's placeholder title, e.g. "New Chat", is never used as the name). Example: `chat-sessions/3f9a2b7c-.../2026-08-22T14-05-30Z_what-is-the-capital-of-france.json`.
+
+Chat-session archival is debounced, not fired after every turn: each new assistant turn restarts a `debounce_seconds` (default 60s) quiet-period timer for that chat, and the transcript only actually archives once the conversation pauses that long — since each snapshot re-sends the full transcript rather than a diff, archiving on every turn would re-run full extraction over the whole growing conversation each time.
 
 Past conversations are searchable the same way documents are:
 
@@ -133,4 +135,4 @@ A `backup` service snapshots FalkorDB and mirrors the MinIO `documents` bucket i
 
 ## Configuration
 
-See `.env.example`. The important settings are `GRAPHITI_API_BASE_URL`, `GRAPHITI_MODEL`, `GRAPHITI_EMBEDDING_MODEL`, `GRAPHITI_EMBEDDING_DIM`, `GRAPHITI_GROUP_ID`, and `GRAPHITI_CHAT_SESSIONS_GROUP_ID` (the separate group chat sessions are archived into). `GRAPHITI_INGEST_TIMEOUT_SECONDS` (default 1800) caps how long the proxy waits for Graphiti extraction on a slow local model before returning an error. `GCOR_API_KEY`, `WEBUI_SECRET_KEY`, `FALKORDB_PASSWORD`, and `GRAFANA_ADMIN_PASSWORD` are the credentials to set before this stack is reachable beyond an isolated dev box — see [Authentication](#authentication). Do not commit `.env` or credentials.
+See `.env.example`. The important settings are `GRAPHITI_API_BASE_URL`, `GRAPHITI_MODEL`, `GRAPHITI_EMBEDDING_MODEL`, `GRAPHITI_EMBEDDING_DIM`, `GRAPHITI_GROUP_ID`, and `GRAPHITI_CHAT_SESSIONS_GROUP_ID` (the separate group chat sessions are archived into). `GRAPHITI_LLM_BASE_URL` / `GRAPHITI_LLM_API_KEY` / `GRAPHITI_LLM_MODEL` control entity/edge extraction specifically (default: routed through openclaw, separate from the Ollama-backed embeddings above — see [docs/adr/0010-graphiti-openclaw-llm.md](docs/adr/0010-graphiti-openclaw-llm.md)). `GRAPHITI_INGEST_TIMEOUT_SECONDS` (default 1800) caps how long the proxy waits for Graphiti extraction before returning an error. `GCOR_API_KEY`, `WEBUI_SECRET_KEY`, `FALKORDB_PASSWORD`, and `GRAFANA_ADMIN_PASSWORD` are the credentials to set before this stack is reachable beyond an isolated dev box — see [Authentication](#authentication). Do not commit `.env` or credentials.
