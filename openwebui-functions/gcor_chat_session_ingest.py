@@ -273,15 +273,18 @@ def _flatten_messages(chat: dict) -> list[dict]:
     if isinstance(raw, list):
         items = raw
     elif isinstance(raw, dict):
-        items = list(raw.values())
+        # Filter to dict entries BEFORE sorting — a malformed/non-dict
+        # value anywhere in history.messages (data corruption, a client
+        # bug) must not crash the whole archive over one bad entry.
+        # Reproduced directly in this suite's own tests: sorting first
+        # crashed with AttributeError on a plain string value.
+        items = [m for m in raw.values() if isinstance(m, dict)]
         items.sort(key=lambda m: m.get("timestamp") or 0)
     else:
         return []
 
     out = []
     for m in items:
-        if not isinstance(m, dict):
-            continue
         role = m.get("role")
         content = m.get("content")
         if role and content:

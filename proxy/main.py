@@ -1848,7 +1848,8 @@ async def api_collection_docs(name: str):
 
 @app.delete("/api/collections/{name}/docs/{doc_id}")
 async def api_archive_document(name: str, doc_id: str):
-    """Delete one Graphiti episode. Source files remain preserved in MinIO.
+    """Delete one Graphiti episode AND the facts it's the sole source of.
+    Source files remain preserved in MinIO.
 
     This is a permanent deletion from the knowledge graph — Graphiti has no
     archive/restore concept (see docs/adr/0001-graphiti-falkordb-backend.md).
@@ -1859,7 +1860,12 @@ async def api_archive_document(name: str, doc_id: str):
         if response.status_code == 404:
             raise HTTPException(status_code=404, detail=f"Episode '{doc_id}' not found")
         response.raise_for_status()
-    return {"status": "deleted", "doc_id": doc_id, "collection": name}
+        graphiti_result = response.json()
+    return {
+        "status": "deleted", "doc_id": doc_id, "collection": name,
+        "edges_deleted": graphiti_result.get("edges_deleted", 0),
+        "edges_updated": graphiti_result.get("edges_updated", 0),
+    }
 
 
 @app.post("/api/collections")

@@ -332,12 +332,86 @@ async def get_episodes(group_id: str, last_n: int = 100):
 
 @app.delete("/episode/{episode_uuid}")
 async def delete_episode(episode_uuid: str):
+    """Delete one episode AND the facts (EntityEdge) it's the sole source
+    of. Previously deleted only the episode node — the edges Graphiti
+    extracted from it survived untouched and stayed fully searchable
+    forever, permanently orphaned from any source. Found directly: a test
+    document deleted via this endpoint (200, "success": true) still had
+    its extracted facts showing up in unrelated /api/search results with
+    real graphiti_edge_uuids, long after its episode was gone from
+    /episodes/{group}'s listing. See docs/adr/0015.
+
+    An edge can be corroborated by multiple episodes (EntityEdge.episodes)
+    — e.g. the same fact re-confirmed across several ingested documents.
+    Deleting the whole edge over one contributing episode being removed
+    would destroy evidence still backed by the others still present, so:
+    strip just this episode's uuid from an edge's `episodes` list if
+    others remain; only delete the edge outright if this was its sole
+    source.
+    """
     try:
         episode = await EpisodicNode.get_by_uuid(app.state.graphiti.driver, episode_uuid)
-        await episode.delete(app.state.graphiti.driver)
     except Exception as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {"success": True}
+
+    edges = await EntityEdge.get_by_group_ids(app.state.graphiti.driver, [episode.group_id])
+    edges_deleted = 0
+    edges_updated = 0
+    for edge in edges:
+        if episode_uuid not in (edge.episodes or []):
+            continue
+        remaining = [e for e in edge.episodes if e != episode_uuid]
+        if remaining:
+            edge.episodes = remaining
+            await edge.save(app.state.graphiti.driver)
+            edges_updated += 1
+        else:
+            await edge.delete(app.state.graphiti.driver)
+            edges_deleted += 1
+
+    await episode.delete(app.state.graphiti.driver)
+    return {"success": True, "edges_deleted": edges_deleted, "edges_updated": edges_updated}
+
+
+@app.post("/admin/gc-orphaned-edges/{group_id}")
+async def gc_orphaned_edges(group_id: str):
+    """One-time (or periodic) cleanup for edges left orphaned by
+    delete_episode()'s bug prior to this fix — it used to delete only the
+    episode node, leaving every edge it produced permanently searchable
+    with no surviving source. Any deployment that ever called single-doc
+    delete before this fix landed has this debt; this endpoint pays it
+    off without needing to know which episode_uuids were ever deleted.
+
+    For every edge in the group: keep only the episode uuids that still
+    exist; delete the edge if none remain, update it if the list changed
+    but isn't empty, leave it untouched otherwise. Safe to run repeatedly
+    — a clean group does no writes.
+    """
+    edges = await EntityEdge.get_by_group_ids(app.state.graphiti.driver, [group_id])
+    episodes = await EpisodicNode.get_by_group_ids(app.state.graphiti.driver, [group_id])
+    live_episode_uuids = {e.uuid for e in episodes}
+
+    edges_deleted = 0
+    edges_updated = 0
+    edges_scanned = len(edges)
+    for edge in edges:
+        current = edge.episodes or []
+        remaining = [e for e in current if e in live_episode_uuids]
+        if len(remaining) == len(current):
+            continue  # nothing orphaned on this edge
+        if remaining:
+            edge.episodes = remaining
+            await edge.save(app.state.graphiti.driver)
+            edges_updated += 1
+        else:
+            await edge.delete(app.state.graphiti.driver)
+            edges_deleted += 1
+
+    return {
+        "success": True, "group_id": group_id,
+        "edges_scanned": edges_scanned,
+        "edges_deleted": edges_deleted, "edges_updated": edges_updated,
+    }
 
 
 @app.delete("/group/{group_id}")

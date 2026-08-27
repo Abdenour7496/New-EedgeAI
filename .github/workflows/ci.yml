@@ -38,20 +38,40 @@ jobs:
       - name: Build proxy image
         run: docker build -t eedgeai-proxy-ci ./proxy
       - name: Run unit tests
-        # Only the unit suite — test_openwebui_stream_smoke.py needs a live
-        # stack (PROXY_CHAT_URL) and is a post-deploy check, not a CI gate.
-        # Code mounted fresh over the built image so this always runs against
-        # the working tree, not whatever was COPYed at image-build time.
+        # Only the unit suite — test_openwebui_stream_smoke.py and
+        # tests/test_ingest.py both need a live stack (PROXY_CHAT_URL /
+        # GCOR_API_KEY against a real running deployment) and are
+        # post-deploy checks, not a CI gate (docs/adr/0015). Code mounted
+        # fresh over the built image so this always runs against the
+        # working tree, not whatever was COPYed at image-build time.
         run: |
           docker run --rm -v "${{ github.workspace }}/proxy:/app" -w /app eedgeai-proxy-ci \
             python -m unittest tests/test_collection_metadata.py tests/test_governance.py -v
+
+  gcor-functions-tests:
+    name: OpenWebUI Function unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies (pydantic, httpx — what the Functions themselves need)
+        run: pip install pydantic httpx
+      - name: Run unit tests
+        run: python -m unittest openwebui-functions/tests/test_gcor_chat_session_ingest.py -v
 
   image-pin-report:
     name: Report unpinned image tags (informational, non-blocking)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: List services still on :latest
+      - name: List services on a floating tag (no @sha256 digest pin)
+        # docs/adr/0014 — every pulled image is now pinned by digest
+        # (image:tag@sha256:...); a plain ":latest"/":alpine" substring
+        # match alone would false-positive on those, since the human-
+        # readable tag portion is unchanged. Flag only lines with an
+        # image: reference that lacks "@sha256:" entirely.
         run: |
           echo "Known, tracked debt — see README.md — not a merge blocker:"
-          grep -n "image:.*:latest" docker-compose.unified.yml || echo "None found."
+          grep -n "image:" docker-compose.unified.yml | grep -v "@sha256:" || echo "None found."
