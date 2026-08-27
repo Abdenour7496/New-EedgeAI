@@ -100,7 +100,9 @@ The MinIO watcher also processes objects placed under `documents/inbox/` (it aut
 
 ## Chat and file capture
 
-Files attached during an Open WebUI chat, and the chat session itself, are captured automatically once the corresponding Function is installed from **Admin Panel > Functions** (see [openwebui-functions/README.md](openwebui-functions/README.md) for install steps):
+This is separate from Open WebUI's own **built-in** file-attach RAG — the "attach a file to a message and ask about it in the same conversation" flow, which needs no Function installed. That path had no OCR capability at all with Open WebUI's default extraction engine, so a scanned PDF/DOCX (no embedded text layer) silently extracted to empty content and the assistant would report nothing was attached — see [docs/adr/0011-openwebui-native-rag-ocr.md](docs/adr/0011-openwebui-native-rag-ocr.md). It's now routed through the proxy's `/api/external-loader/process` (OpenWebUI's own "external" content-extraction-engine contract), which reuses the same OCR-on-empty-extraction logic as `/api/ingest` (see ADR 0009) — fast local Tesseract OCR, not the full Document Intelligence pipeline, since this call is synchronous and blocks the chat response.
+
+Files attached during an Open WebUI chat, and the chat session itself, are *additionally* captured into the durable Graphiti/MinIO knowledge base automatically once the corresponding Function is installed from **Admin Panel > Functions** (see [openwebui-functions/README.md](openwebui-functions/README.md) for install steps) — this is a separate background pipeline from the immediate in-chat RAG above; the two don't share results with each other:
 
 | Function | Captures | Stored at | Indexed into |
 |---|---|---|---|

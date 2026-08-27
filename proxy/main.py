@@ -51,6 +51,7 @@ import re
 import time
 import uuid
 from datetime import datetime, timezone
+from urllib.parse import unquote
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
@@ -2350,6 +2351,54 @@ async def api_docint(
         },
         "text_preview": result.text[:500],
     }
+
+
+@app.put("/api/external-loader/process")
+async def external_loader_process(request: Request):
+    """OpenWebUI's native file-attach RAG "external" content-extraction-engine
+    contract (see docs/adr/0011-openwebui-native-rag-ocr.md) — a PUT of the
+    raw file bytes, returning {"page_content": ..., "metadata": ...}.
+
+    Without this, OpenWebUI's own built-in file-attach RAG (a completely
+    separate code path from gcor_file_ingest/Graphiti — see ADR 0008) has no
+    OCR capability at all with its default extraction engine: a scanned PDF
+    attached directly to a chat silently extracts to empty content and the
+    assistant reports "I don't see anything attached", independent of
+    gcor_file_ingest's own (already-OCR-capable, per ADR 0009) background
+    archival pipeline succeeding. Reuses the same plain-extraction-first,
+    OCR-only-if-needed logic as /api/ingest.
+
+    Deliberately does NOT run the full DocInt pipeline (tables/forms/
+    classification/entities) — this call is synchronous and blocks the
+    chat response OpenWebUI is building, so it stays to fast local
+    Tesseract OCR only, not multi-second openclaw round-trips.
+    """
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    filename = unquote(request.headers.get("x-filename", "") or "upload")
+    ext = os.path.splitext(filename)[1].lower()
+
+    try:
+        text = _extract_text(filename, data).strip()
+        if not text and ext in {".pdf", ".docx"}:
+            result: DocIntelResult = await process_document(
+                filename, data,
+                extract_tables=False, extract_forms=False,
+                extract_entities=False, classify=False, vision=False,
+            )
+            text = result.text.strip()
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Extraction failed: {exc}")
+
+    if not text:
+        raise HTTPException(status_code=422, detail="No text extracted")
+
+    return JSONResponse(content={
+        "page_content": text,
+        "metadata": {"filename": filename},
+    })
 
 
 @app.get("/health")

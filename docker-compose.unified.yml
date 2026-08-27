@@ -501,6 +501,21 @@ services:
       # docs/adr/0008-openwebui-embedding-model-mismatch.md. Must match
       # OLLAMA_EMBEDDING_MODEL below / on the proxy.
       RAG_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}
+      # OpenWebUI's default file-attach content extraction has NO OCR
+      # capability at all — a scanned PDF/DOCX attached directly to a chat
+      # silently extracts to empty content and the assistant reports "I
+      # don't see anything attached", independent of the embedding-model
+      # fix above and independent of gcor_file_ingest's own (already
+      # OCR-capable, see docs/adr/0009) background archival pipeline
+      # succeeding — that's a separate code path that doesn't feed back
+      # into this same immediate chat turn. Routes through the proxy's
+      # /api/external-loader/process (OpenWebUI's documented "external"
+      # engine contract), which reuses the same plain-extraction-first,
+      # OCR-only-if-needed logic. See
+      # docs/adr/0011-openwebui-native-rag-ocr.md.
+      CONTENT_EXTRACTION_ENGINE: external
+      EXTERNAL_DOCUMENT_LOADER_URL: http://proxy:5001/api/external-loader
+      EXTERNAL_DOCUMENT_LOADER_API_KEY: ${GCOR_API_KEY:-openclaw}
       ENABLE_RAG_LOCAL_WEB_FETCH: "false"
       # Ollama — fallback model when Anthropic is unavailable
       OLLAMA_BASE_URL: http://ollama:11434
