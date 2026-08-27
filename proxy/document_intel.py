@@ -27,9 +27,11 @@ Env vars
   ANTHROPIC_API_KEY     used when LLM_BACKEND=anthropic
   LLM_BACKEND           openai|anthropic|ollama|openclaw (default openai)
   VISION_BACKEND        same options, overrides LLM_BACKEND for vision calls only
-  OPENCLAW_BASE_URL     used when LLM_BACKEND/VISION_BACKEND=openclaw — routes
-                        through Codex/Claude Code CLI subscriptions instead of
-                        a pay-per-token API key
+  PROXY_OPENCLAW_URL    used when LLM_BACKEND/VISION_BACKEND=openclaw — this
+                        proxy's own /v1/openclaw passthrough (Codex/Claude
+                        Code CLI subscriptions with Ollama-on-failure
+                        fallback), not openclaw directly
+  GCOR_API_KEY          auth for the above (this proxy's own shared secret)
 """
 
 from __future__ import annotations
@@ -61,8 +63,17 @@ VISION_MODEL    = os.getenv("VISION_MODEL",
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "llama3.2")
 OLLAMA_VISION_MODEL   = os.getenv("OLLAMA_VISION_MODEL", "llava:7b")
-OPENCLAW_BASE_URL      = os.getenv("OPENCLAW_BASE_URL",      "http://openclaw:18799/v1")
-OPENCLAW_GATEWAY_TOKEN = os.getenv("OPENCLAW_GATEWAY_TOKEN", "")
+# Routes through this proxy's own /v1/openclaw passthrough (main.py,
+# self-referential localhost call — document_intel.py runs inside the same
+# container/process as the proxy) rather than straight to openclaw, so
+# DocInt inherits the exact same Ollama-on-failure fallback the main chat
+# pipeline and Graphiti extraction already have (call_openclaw() in
+# main.py). Previously called openclaw directly with no fallback at all —
+# an openclaw outage silently zeroed out table/form/classification/entity
+# extraction (caught, logged, defaulted) rather than degrading to a working
+# local model. See docs/adr/0013-docint-openclaw-fallback.md.
+PROXY_OPENCLAW_URL = os.getenv("PROXY_OPENCLAW_URL", "http://localhost:5001/v1/openclaw")
+GCOR_API_KEY        = os.getenv("GCOR_API_KEY", "")
 MAX_TOKENS_TEXT = 2048
 MAX_TOKENS_VIS  = 1500
 
@@ -177,15 +188,15 @@ class DocIntelResult:
 async def _chat(messages: list[dict], max_tokens: int = MAX_TOKENS_TEXT) -> str:
     """Call the configured LLM with text-only messages."""
     if LLM_BACKEND == "openclaw":
-        # Routes through the openclaw gateway's Codex/Claude Code CLI
-        # subscriptions instead of a pay-per-token API key — see
-        # docs/adr for why (both OpenAI and Anthropic accounts were out
-        # of credit as of 2026-08-26). Same endpoint/shape main.py's
-        # call_openclaw() uses for the primary chat pipeline.
+        # Via this proxy's own /v1/openclaw passthrough, not openclaw
+        # directly — inherits its Ollama-on-failure fallback (same
+        # call_openclaw() the main chat pipeline and Graphiti extraction
+        # use) instead of hard-failing if openclaw is unreachable. See
+        # docs/adr/0013-docint-openclaw-fallback.md.
         async with httpx.AsyncClient(timeout=120) as c:
             r = await c.post(
-                f"{OPENCLAW_BASE_URL}/chat/completions",
-                headers={"Authorization": f"Bearer {OPENCLAW_GATEWAY_TOKEN}",
+                f"{PROXY_OPENCLAW_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {GCOR_API_KEY}",
                          "Content-Type": "application/json"},
                 json={"model": "openclaw", "max_tokens": max_tokens, "messages": messages},
             )
@@ -227,47 +238,59 @@ async def _chat(messages: list[dict], max_tokens: int = MAX_TOKENS_TEXT) -> str:
         return r.json()["choices"][0]["message"]["content"].strip()
 
 
+async def _vision_via_ollama(png_b64: str, prompt: str, max_tokens: int) -> str:
+    """Local Ollama vision call — OLLAMA_VISION_MODEL (llava:7b), not
+    OLLAMA_MODEL (llama3.2, text-only). Shared by the "ollama" VISION_BACKEND
+    branch and the openclaw branch's explicit fallback below."""
+    async with httpx.AsyncClient(timeout=120) as c:
+        r = await c.post(
+            f"{OLLAMA_BASE_URL}/v1/chat/completions",
+            json={"model": OLLAMA_VISION_MODEL, "max_tokens": max_tokens,
+                  "messages": [{"role": "user", "content": [
+                      {"type": "image_url", "image_url": {
+                          "url": f"data:image/png;base64,{png_b64}"}},
+                      {"type": "text", "text": prompt},
+                  ]}]},
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+
+
 async def _vision(png_b64: str, prompt: str, max_tokens: int = MAX_TOKENS_VIS) -> str:
     """Call the vision model with a PNG image (base64) and a text prompt."""
     _vb = VISION_BACKEND   # respects VISION_BACKEND env, falls back to LLM_BACKEND
 
     if _vb == "openclaw":
-        # Same subscription-backed gateway as _chat() above — the
-        # underlying Codex/Claude Code CLI runtimes handle image input.
-        async with httpx.AsyncClient(timeout=120) as c:
-            r = await c.post(
-                f"{OPENCLAW_BASE_URL}/chat/completions",
-                headers={"Authorization": f"Bearer {OPENCLAW_GATEWAY_TOKEN}",
-                         "Content-Type": "application/json"},
-                json={"model": "openclaw", "max_tokens": max_tokens,
-                      "messages": [{"role": "user", "content": [
-                          {"type": "image_url", "image_url": {
-                              "url": f"data:image/png;base64,{png_b64}"}},
-                          {"type": "text", "text": prompt},
-                      ]}]},
-            )
-            r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"].strip()
+        # Via this proxy's own /v1/openclaw passthrough — but unlike
+        # _chat(), NOT relying on call_openclaw()'s own built-in
+        # Ollama-on-failure fallback for this one: that fallback uses
+        # OLLAMA_MODEL (llama3.2, text-only), which would silently mishandle
+        # image content sent to it. Falls back explicitly to
+        # _vision_via_ollama() instead, which uses the correct
+        # OLLAMA_VISION_MODEL (llava:7b). See
+        # docs/adr/0013-docint-openclaw-fallback.md.
+        try:
+            async with httpx.AsyncClient(timeout=120) as c:
+                r = await c.post(
+                    f"{PROXY_OPENCLAW_URL}/chat/completions",
+                    headers={"Authorization": f"Bearer {GCOR_API_KEY}",
+                             "Content-Type": "application/json"},
+                    json={"model": "openclaw", "max_tokens": max_tokens,
+                          "messages": [{"role": "user", "content": [
+                              {"type": "image_url", "image_url": {
+                                  "url": f"data:image/png;base64,{png_b64}"}},
+                              {"type": "text", "text": prompt},
+                          ]}]},
+                )
+                r.raise_for_status()
+                return r.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            log.warning("DocInt: openclaw vision call failed (%s), falling back to local %s",
+                        e, OLLAMA_VISION_MODEL)
+            return await _vision_via_ollama(png_b64, prompt, max_tokens)
 
     if _vb == "ollama":
-        # Use Ollama's vision-capable model — was using OLLAMA_MODEL
-        # (llama3.2, text-only) instead of OLLAMA_VISION_MODEL (llava:7b,
-        # already pulled locally per docker-compose.unified.yml's
-        # ollama-init). Never hit in practice while VISION_BACKEND
-        # defaulted elsewhere first, but would have silently misbehaved
-        # (non-vision model asked to describe an image) if ever selected.
-        async with httpx.AsyncClient(timeout=120) as c:
-            r = await c.post(
-                f"{OLLAMA_BASE_URL}/v1/chat/completions",
-                json={"model": OLLAMA_VISION_MODEL, "max_tokens": max_tokens,
-                      "messages": [{"role": "user", "content": [
-                          {"type": "image_url", "image_url": {
-                              "url": f"data:image/png;base64,{png_b64}"}},
-                          {"type": "text", "text": prompt},
-                      ]}]},
-            )
-            r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"].strip()
+        return await _vision_via_ollama(png_b64, prompt, max_tokens)
 
     if _vb == "anthropic" and ANTHROPIC_KEY:
         async with httpx.AsyncClient(timeout=60) as c:
