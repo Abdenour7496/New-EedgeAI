@@ -1935,6 +1935,55 @@ async def api_search(
     return {"collection": collection, "query": q, "results": results}
 
 
+# ── Ingest idempotency guard ────────────────────────────────────────────────
+# Graphiti extraction can genuinely take a while (docs/adr/0003, 0010) — a
+# caller whose own timeout is shorter than the server's has no way to know
+# whether the request actually succeeded server-side. Both doc_id
+# computations below are time-based, not content-based, so a naive retry of
+# identical content creates a second, fully-duplicate Graphiti episode.
+# Reproduced directly while manually verifying ingestion: a client-side
+# ReadTimeout on a request that had actually already succeeded server-side
+# left two duplicate episodes in Graphiti for one logical submission. Cache
+# recent results by a hash of the actual submitted content, short-lived —
+# this targets "client gave up and is retrying", not general content dedup
+# (re-ingesting the same document a day later is expected to create a fresh
+# episode, e.g. to pick up an updated valid_to).
+_INGEST_IDEMPOTENCY_TTL_SECONDS = float(os.getenv("INGEST_IDEMPOTENCY_TTL_SECONDS", "600"))
+_recent_ingest_results: dict[str, tuple[float, dict]] = {}
+_ingest_idempotency_lock = asyncio.Lock()
+
+
+def _evict_stale_ingest_cache(now: float) -> None:
+    stale = [
+        key for key, (ts, _) in _recent_ingest_results.items()
+        if now - ts > _INGEST_IDEMPOTENCY_TTL_SECONDS
+    ]
+    for key in stale:
+        _recent_ingest_results.pop(key, None)
+
+
+def _ingest_idempotency_key(*parts: str | bytes) -> str:
+    h = hashlib.sha256()
+    for part in parts:
+        h.update(part.encode("utf-8", errors="ignore") if isinstance(part, str) else part)
+        h.update(b"\x1f")  # unit separator, so "ab"+"c" and "a"+"bc" hash differently
+    return h.hexdigest()
+
+
+async def _ingest_idempotency_check(key: str) -> dict | None:
+    """Return a cached result for `key` if one is still fresh, else None."""
+    async with _ingest_idempotency_lock:
+        now = time.monotonic()
+        _evict_stale_ingest_cache(now)
+        cached = _recent_ingest_results.get(key)
+        return cached[1] if cached is not None else None
+
+
+async def _ingest_idempotency_store(key: str, result: dict) -> None:
+    async with _ingest_idempotency_lock:
+        _recent_ingest_results[key] = (time.monotonic(), result)
+
+
 async def _ingest_bytes(
     filename: str,
     data: bytes,
@@ -1961,6 +2010,17 @@ async def _ingest_bytes(
     ext = _resolve_ext(filename, data)
     if ext not in _INGEST_ACCEPT:
         raise HTTPException(status_code=415, detail=f"Unsupported type '{ext}'")
+
+    idempotency_key = _ingest_idempotency_key(
+        filename, collection, bucket, agent_id, access_level, str(enable_docint), data,
+    )
+    cached = await _ingest_idempotency_check(idempotency_key)
+    if cached is not None:
+        logger.info(
+            "Ingest '%s': duplicate submission within %ds, returning cached result (doc_id=%s)",
+            filename, int(_INGEST_IDEMPOTENCY_TTL_SECONDS), cached.get("document_id"),
+        )
+        return cached
 
     doc_title  = title.strip() or filename
     doc_id     = hashlib.md5(f"{filename}-{datetime.now().isoformat()}".encode()).hexdigest()[:16]
@@ -2069,6 +2129,7 @@ async def _ingest_bytes(
         result_json["docint"] = docint_summary
     if storage_key:
         result_json["storage"] = {"bucket": target_bucket, "key": storage_key}
+    await _ingest_idempotency_store(idempotency_key, result_json)
     return result_json
 
 
@@ -2225,6 +2286,17 @@ async def api_ingest_session(request: Request):
     if not transcript_text:
         raise HTTPException(status_code=422, detail="No text content in messages")
 
+    idempotency_key = _ingest_idempotency_key(
+        session_id, collection, agent_id, access_level, transcript_text,
+    )
+    cached = await _ingest_idempotency_check(idempotency_key)
+    if cached is not None:
+        logger.info(
+            "Ingest session '%s': duplicate submission within %ds, returning cached result (doc_id=%s)",
+            session_id, int(_INGEST_IDEMPOTENCY_TTL_SECONDS), cached.get("document_id"),
+        )
+        return cached
+
     now       = datetime.now(timezone.utc)
     timestamp = now.isoformat()
     file_stamp = now.strftime("%Y-%m-%dT%H-%M-%SZ")
@@ -2278,6 +2350,7 @@ async def api_ingest_session(request: Request):
     }
     if storage_key:
         result["storage"] = {"bucket": S3_BUCKET, "key": storage_key}
+    await _ingest_idempotency_store(idempotency_key, result)
     return result
 
 

@@ -68,13 +68,22 @@ services:
       NEO4J_USER: unused
       NEO4J_PASSWORD: unused
       GRAPHITI_TELEMETRY_ENABLED: "false"
-      # Was 2, sized for local Ollama calls taking minutes each. Modest bump
-      # now that a typical extraction call via openclaw takes ~8s instead —
-      # kept conservative (not higher) since openclaw's own concurrency
-      # headroom (Codex/Claude Code CLI subscriptions) hasn't been load
-      # tested; raise further only after watching it hold up under real
-      # concurrent ingest load.
-      SEMAPHORE_LIMIT: ${GRAPHITI_SEMAPHORE_LIMIT:-4}
+      # Load-tested this, not guessed: openclaw's HTTP chat/completions calls
+      # all land on its own internal "main" command lane, shared with every
+      # interactive user chat turn (proxy/main.py's call_openclaw) — and
+      # that lane's real concurrency cap is 4 (openclaw's own
+      # agents.defaults.maxConcurrent default; confirmed directly in its
+      # bundled source, dist/agent-limits-*.js). A prior version of this set
+      # SEMAPHORE_LIMIT to 4 to match openclaw's per-call speed (~8s vs
+      # local Ollama's minutes) without realizing it could then claim the
+      # ENTIRE shared lane during a busy ingest, starving live chat and
+      # DocInt of any concurrency at all. Reproduced directly: a one-chunk
+      # text ingest took ~200s (vs. ~8-10s uncontended) while real chat
+      # traffic was active, with openclaw's own diagnostics showing
+      # activeAhead=4/queueBehind>0. Set below the shared lane's cap, not
+      # at it, so background ingestion never fully starves interactive
+      # traffic. See docs/adr/0012-ingest-concurrency-and-idempotency.md.
+      SEMAPHORE_LIMIT: ${GRAPHITI_SEMAPHORE_LIMIT:-2}
     depends_on:
       falkordb:
         condition: service_healthy
