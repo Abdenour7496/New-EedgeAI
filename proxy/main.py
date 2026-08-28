@@ -36,8 +36,6 @@ Other endpoints
 ───────────────
   GET  /v1/models              → live OpenAI model list (with fallback)
   POST /v1/embeddings          → proxied to OpenAI
-  POST /v1/buzz/chat/completions → bearer-authenticated GCOR entry point for the
-                                    Buzz collaboration bridge (see BUZZ_BRIDGE_API_KEY)
   GET  /health                 → liveness check
 """
 
@@ -296,28 +294,6 @@ async def graphiti_ingest(
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.0"))
 # Agent id scopes memory/belief/inference retrieval to a single partition
 AGENT_ID = os.getenv("AGENT_ID", "")
-
-# ── Buzz bridge (optional --profile buzz integration) ─────────────────────────
-# Shared secret the buzz-agent-bridge container presents on /v1/buzz/chat/completions.
-# That route is reachable from the Buzz relay's channel traffic (humans + agents),
-# a less-trusted source than the internal-network-only /v1/chat/completions, so it
-# is closed (503) unless this is explicitly set.
-BUZZ_BRIDGE_API_KEY = os.getenv("BUZZ_BRIDGE_API_KEY", "")
-# Optional allowlist restricting which collections Buzz-originated queries may target.
-# Empty = no restriction beyond what /v1/chat/completions already allows.
-BUZZ_ALLOWED_COLLECTIONS = [
-    c.strip() for c in os.getenv("BUZZ_ALLOWED_COLLECTIONS", "").split(",") if c.strip()
-]
-BUZZ_BRIDGE_RATE_LIMIT = int(os.getenv("BUZZ_BRIDGE_RATE_LIMIT_PER_MIN", "30"))
-# buzz-acp bundles base prompt + up to BUZZ_ACP_CONTEXT_MESSAGE_LIMIT prior
-# messages + memory injection into a single message, easily tens of KB —
-# 8000 chars (initial guess) was too tight for real traffic and rejected
-# legitimate turns outright.
-BUZZ_BRIDGE_MAX_MESSAGE_CHARS = int(os.getenv("BUZZ_BRIDGE_MAX_MESSAGE_CHARS", "100000"))
-# Cap on /v1/buzz/ingest uploads — this route is reachable from Buzz channel
-# content (an image attachment or a storage_key lookup), so unlike the
-# internal-network-only /api/ingest it needs its own size ceiling.
-BUZZ_BRIDGE_MAX_UPLOAD_BYTES = int(os.getenv("BUZZ_BRIDGE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 
 # ── Document storage (MinIO, S3-compatible) ───────────────────────────────────
 # Best-effort: ingestion still works if MinIO is unreachable or unconfigured,
@@ -1538,124 +1514,6 @@ async def openclaw_chat_completions_raw(request: Request):
     """
     body = await request.json()
     return await call_openclaw(body)
-
-
-# ── Buzz bridge ──────────────────────────────────────────────────────────────
-# In-process sliding-window limiter — the Buzz bridge is a single trusted
-# caller, this just bounds cost/blast-radius if its token ever leaks or the
-# bridge misbehaves (e.g. a workflow loop re-triggering itself).
-_buzz_rate_lock: "asyncio.Lock | None" = None
-_buzz_rate_window: list[float] = []
-
-
-async def _check_buzz_rate_limit():
-    global _buzz_rate_lock
-    if _buzz_rate_lock is None:
-        _buzz_rate_lock = asyncio.Lock()
-    now = time.monotonic()
-    async with _buzz_rate_lock:
-        while _buzz_rate_window and now - _buzz_rate_window[0] > 60:
-            _buzz_rate_window.pop(0)
-        if len(_buzz_rate_window) >= BUZZ_BRIDGE_RATE_LIMIT:
-            raise HTTPException(status_code=429, detail="Buzz bridge rate limit exceeded")
-        _buzz_rate_window.append(now)
-
-
-@app.post("/v1/buzz/chat/completions")
-async def buzz_chat_completions(request: Request):
-    """Bearer-authenticated GCOR entry point for the Buzz collaboration bridge.
-
-    Buzz channel content (human or agent authored) is a less-trusted source than
-    the rest of the internal docker network, so this route is separate from
-    /v1/chat/completions: it requires BUZZ_BRIDGE_API_KEY, caps message size,
-    optionally restricts which collection may be queried, and rate-limits.
-    """
-    if not BUZZ_BRIDGE_API_KEY:
-        raise HTTPException(status_code=503, detail="Buzz bridge is not configured")
-
-    auth = request.headers.get("authorization", "")
-    scheme, _, token = auth.partition(" ")
-    if scheme.lower() != "bearer" or not hmac.compare_digest(token, BUZZ_BRIDGE_API_KEY):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    await _check_buzz_rate_limit()
-
-    body = await request.json()
-    messages = body.get("messages", [])
-    if not isinstance(messages, list) or not messages or len(messages) > 50:
-        raise HTTPException(status_code=400, detail="Invalid messages")
-    for m in messages:
-        content = m.get("content", "") if isinstance(m, dict) else None
-        # Same two shapes last_user_text() already tolerates: a plain string, or
-        # OpenAI-style content-part blocks ([{"type": "text", "text": "..."}]) —
-        # buzz-agent's OpenAI-compat client sends the latter.
-        if isinstance(content, str):
-            text_len = len(content)
-        elif isinstance(content, list):
-            text_len = sum(
-                len(p.get("text", "")) for p in content
-                if isinstance(p, dict) and p.get("type") == "text"
-            )
-        else:
-            raise HTTPException(status_code=400, detail="Invalid message content")
-        if text_len > BUZZ_BRIDGE_MAX_MESSAGE_CHARS:
-            raise HTTPException(status_code=400, detail="Message content too long")
-
-    rag_collection = _request_rag_collection(body, request)
-    if BUZZ_ALLOWED_COLLECTIONS and rag_collection not in (None, *BUZZ_ALLOWED_COLLECTIONS):
-        raise HTTPException(status_code=403, detail="Collection not permitted for Buzz bridge")
-
-    body = {**body, "model": "openclaw"}  # always answer via the GCOR pipeline, ignore caller-supplied model
-    return await _run_chat_completion(body, rag_collection)
-
-
-@app.post("/v1/buzz/ingest")
-async def buzz_ingest(
-    request: Request,
-    background_tasks: BackgroundTasks,
-    file: UploadFile | None = File(None),
-    storage_key: str = Form(""),
-):
-    """Buzz-facing document ingestion — same trust boundary and auth as
-    /v1/buzz/chat/completions (BUZZ_BRIDGE_API_KEY, shared rate limit).
-
-    Two ways in, both used by the bridge:
-      - multipart file upload — an image attachment pulled off a Buzz message
-        (Buzz's own media pipeline only accepts images, so this is the only
-        binary content a channel can actually produce).
-      - storage_key — ingest (or re-confirm) a file that's already sitting in
-        MinIO under documents/inbox/, processed/, failed/, or originals/*/,
-        for the '@bot ingest <name>' text-reference path.
-    """
-    if not BUZZ_BRIDGE_API_KEY:
-        raise HTTPException(status_code=503, detail="Buzz bridge is not configured")
-
-    auth = request.headers.get("authorization", "")
-    scheme, _, token = auth.partition(" ")
-    if scheme.lower() != "bearer" or not hmac.compare_digest(token, BUZZ_BRIDGE_API_KEY):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    await _check_buzz_rate_limit()
-
-    if file is not None:
-        data = await file.read()
-        filename = file.filename or "upload"
-    elif storage_key.strip():
-        data, filename = await _find_and_fetch_from_s3(storage_key.strip())
-        if data is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"'{storage_key}' not found in MinIO (checked bucket root, inbox/, processed/, failed/, originals/*)",
-            )
-    else:
-        raise HTTPException(status_code=400, detail="Provide either a file or storage_key")
-
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty file")
-    if len(data) > BUZZ_BRIDGE_MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=400, detail="File too large")
-
-    return await _ingest_bytes(filename, data, background_tasks=background_tasks, enable_docint=True)
 
 
 async def _run_chat_completion(body: dict, rag_collection: str | None):
