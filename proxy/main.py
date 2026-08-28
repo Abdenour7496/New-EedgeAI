@@ -10,8 +10,11 @@ Architecture
 
 This replaced an earlier Neo4j + Qdrant dual-write design — see
 docs/adr/0001-graphiti-falkordb-backend.md for the migration rationale.
-Confidence filtering, temporal validity, and agent/access-level partitioning
-are still applied client-side in _filter_hits() over Graphiti's results.
+Confidence filtering and agent/access-level partitioning are still applied
+client-side in _filter_hits() over Graphiti's results. A third,
+wall-clock-based temporal-validity filter used to run there too — removed,
+see docs/adr/0019-search-staleness-was-a-test-fixture-bug.md and
+_filter_hits()'s own docstring for why.
 
 ─────────────────────────────────────────────────────────────────────────────
 Retrieval flow for every /v1/chat/completions request
@@ -23,7 +26,7 @@ Retrieval flow for every /v1/chat/completions request
 
   2. HYBRID RETRIEVAL  (Graphiti / FalkorDB)
      graphiti_search() → temporal facts, min-max normalised and filtered by
-     score, confidence, temporal validity, and access control (_filter_hits)
+     score, confidence, and access control (_filter_hits)
 
   3. REFLECTION CHECK
      No graph records but facts exist → fall back to fact text
@@ -632,10 +635,38 @@ def _filter_hits(hits: list) -> list:
     """
     Apply cognitive filters to raw Qdrant hits:
       1. Confidence threshold — payload.confidence below minimum is discarded
-      2. Temporal validity   — expired valid_to is discarded
-      3. Access control      — access_level incompatible with AGENT_ID is discarded
+      2. Access control       — access_level incompatible with AGENT_ID is discarded
+
+    A third filter — dropping a hit whose valid_from/valid_to window didn't
+    currently contain wall-clock "now" — used to run here too. Removed: it
+    predates the Graphiti/FalkorDB backend (see docs/adr/0001) and was never
+    re-validated against Graphiti's actual valid_at/invalid_at semantics,
+    which conflate two different things under one field pair — genuine
+    supersession (a newer fact contradicts an older one — fine to hide) and
+    a validity *window* merely extracted from the source text (e.g. "Q2
+    2024 revenue") — which for a historical/reporting statement does not
+    mean the fact stops being true or citable once that window ends. In
+    practice this meant any document mentioning a specific past or future
+    date/period became permanently unsearchable — found and root-caused via
+    docs/adr/0019-search-staleness-was-a-test-fixture-bug.md, which chased
+    what looked like a Graphiti/FalkorDB staleness bug for two sessions
+    before landing here. valid_from/valid_to are still passed through in
+    each hit's payload for display (citation badges, _temporal_badge()) and
+    as a belief-conflict tiebreaker (resolve_belief_conflicts()) — both
+    informational uses, not filters, and both left unchanged.
+
+    This also removes the only consumer of /api/ingest's `valid_hours`
+    parameter (an unused, dormant feature — grepped the rest of the repo,
+    no caller ever sets it): it worked, when it worked at all, by embedding
+    a "Valid until: <timestamp>" text line into the episode and hoping
+    Graphiti's LLM extraction faithfully turned that into a matching
+    invalid_at on every fact from that episode — an indirect, unverified
+    mechanism relying on the same conflated field this fix removes as a
+    filter axis. If genuine content-expiry is needed later, it deserves
+    its own explicit, structured mechanism (e.g. an episode-level property
+    checked before Graphiti's own extraction, not an LLM-inferred edge
+    field) rather than reviving this one.
     """
-    now = _now_iso()
     filtered = []
     for h in hits:
         p = h.get("payload") or {}
@@ -645,16 +676,6 @@ def _filter_hits(hits: list) -> list:
         if node_confidence is not None and node_confidence < CONFIDENCE_THRESHOLD:
             logger.debug("Dropping hit %s: confidence %.2f < %.2f",
                          h.get("id"), node_confidence, CONFIDENCE_THRESHOLD)
-            continue
-
-        # ── temporal validity ─────────────────────────────────────────────────
-        valid_to = p.get("valid_to")
-        if valid_to and valid_to < now:
-            logger.debug("Dropping hit %s: expired valid_to %s", h.get("id"), valid_to)
-            continue
-        valid_from = p.get("valid_from")
-        if valid_from and valid_from > now:
-            logger.debug("Dropping hit %s: not yet valid (valid_from %s)", h.get("id"), valid_from)
             continue
 
         # ── access control ────────────────────────────────────────────────────

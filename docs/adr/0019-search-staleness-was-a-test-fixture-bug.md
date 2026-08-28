@@ -1,7 +1,8 @@
 # ADR 0019: The "search staleness" bug was never in Graphiti/FalkorDB — it was a temporal-filter mismatch
 
-**Status:** Accepted — test-level root cause found and fixed; a related
-production-code question is left open for a decision (see Consequences)
+**Status:** Accepted — root cause found and fixed, both at the test level
+and in production code (`_filter_hits()`'s temporal-validity filter
+removed — see "Update: production fix" at the end)
 **Date:** 2026-08-28
 **Decision owners:** EedgeAI maintainers
 **Corrects:** docs/adr/0016, docs/adr/0017, docs/adr/0018 (all superseded
@@ -110,11 +111,9 @@ semantics still line up. They don't, for one specific and common case:
    Same reasoning — a real, low-cost, well-scoped check for a different
    failure mode this investigation never found evidence of, but which
    remains worth watching for.
-4. **Did not change `_filter_hits()`'s production filtering logic in this
-   pass.** This affects real search behavior for every document that
-   mentions a specific past date/period — a meaningfully large surface —
-   and the right fix depends on a product decision (see Consequences),
-   not something to change unilaterally mid-investigation.
+4. **`_filter_hits()`'s temporal-validity filtering was removed** (see
+   "Update: production fix" below) — the user explicitly asked for the
+   production issue to be fixed, not just the test.
 
 ## What this means for those ADRs
 
@@ -148,27 +147,59 @@ each step; this ADR is the conclusion that work was building toward.
 - `test_ingest_then_search_finds_it` now passes reliably, every run, with
   no dependency on Graphiti restart timing or which calendar date the
   fixture happens to name.
-- **Open product question, not resolved here:** does `_filter_hits()`
-  correctly handle a real document that names a specific past
-  date/period? Right now, no — that content becomes unsearchable once the
-  named period ends (often immediately, for most real-world content).
-  Options worth considering in a future pass, not decided here:
-  - Stop using Graphiti's `invalid_at` as an automatic "hide it" signal
-    for `_filter_hits()`'s temporal check, since it conflates genuine
-    supersession with a stated-but-still-true historical window; possibly
-    rely on some other signal for supersession specifically (needs
-    investigation into what graphiti-core actually exposes to
-    distinguish the two cases, if anything, at the API level).
-  - Drop the temporal-validity check entirely for Graphiti-sourced hits
-    and rely on Graphiti's own dedup/contradiction handling at ingest
-    time instead (it already creates/updates edges to reflect the latest
-    known state; the open question is only whether *superseded* old
-    facts should also remain searchable as history, which is a genuine
-    product judgment call).
-  - Something narrower: only treat `invalid_at` as "hide it" when it's
-    very recent relative to the edge's own `created_at` (suggesting
-    active supersession discovered at ingest time) rather than when it's
-    old relative to wall-clock `now` (which just means the stated period
-    has naturally elapsed).
-  This needs a decision from whoever owns the product behavior here — it
-  changes what real users can find, not just test reliability.
+
+## Update: production fix
+
+Asked directly to fix the underlying issue, not just the test. Removed
+`_filter_hits()`'s wall-clock temporal-validity check
+(`valid_from > now` / `valid_to < now`) entirely — see the function's own
+docstring in `proxy/main.py` for the full reasoning. Considered three
+narrower alternatives (distinguish supersession from a stated window via
+some other graphiti-core signal; gate on `invalid_at` being close to the
+edge's own `created_at` rather than to wall-clock `now`; leave it as a
+product decision) and rejected all three in favor of outright removal:
+
+- graphiti-core's public API doesn't expose a clean way to distinguish
+  "invalidated by a later contradicting fact" from "extracted validity
+  window from the source text" — both surface identically as
+  `invalid_at`/`expired_at` on the edge.
+- The `created_at`-relative-gating idea doesn't actually work: checked it
+  directly against real data — a *future*-dated fact ("Q4 2026") has
+  `invalid_at` *after* `created_at` for the same reason a genuinely
+  superseded fact would (both describe something that starts after
+  ingestion time), so that signal doesn't separate the two cases either.
+- graphiti-core's own default `search()` behavior already does not filter
+  by temporal validity — it returns period-scoped and even superseded
+  facts and lets relevance ranking do its job. Matching that default
+  rather than fighting it is the safer, more consistent choice for a
+  system whose stated purpose is broad knowledge retrieval, not "what is
+  true right now" queries specifically.
+
+This also removes the only real consumer of `/api/ingest`'s
+`valid_hours` parameter (an unused, dormant feature — confirmed via grep,
+no caller anywhere in this repo ever sets it). It worked, when it worked
+at all, by embedding a "Valid until: `<timestamp>`" text line into the
+episode and relying on Graphiti's LLM extraction to faithfully turn that
+into a matching `invalid_at` on every fact from that episode — an
+indirect, never-verified mechanism riding on the same field this fix
+removes as a filter axis. If genuine content-expiry is needed later, it
+deserves its own explicit, structured implementation rather than reviving
+this one.
+
+**Verified:**
+- Two fresh documents — one naming a firmly past quarter ("Q2 2024"), one
+  naming a future quarter ("Q4 2026") — both now correctly surface via
+  the proxy's `/api/search`, ranked #1, immediately. Both used to be
+  silently dropped.
+- All 23 mocked/CI-gated unit tests pass, including 4 new regression
+  tests (`test_governance.py`'s `FilterHitsTemporalValidityRemovedTests`)
+  covering exactly these two shapes plus "no temporal fields" and
+  "confidence/access-control filtering still applies alongside".
+- The full live integration suite (`test_ingest.py`, all 3 tests) passes
+  cleanly.
+
+`valid_from`/`valid_to` are still passed through in every hit's payload
+unchanged — they remain used for display (`_temporal_badge()`, shown in
+citations) and as a belief-conflict tiebreaker
+(`resolve_belief_conflicts()`), both informational/non-filtering uses
+that this change does not touch.
