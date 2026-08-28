@@ -73,5 +73,5 @@ jobs:
         # readable tag portion is unchanged. Flag only lines with an
         # image: reference that lacks "@sha256:" entirely.
         run: |
-          echo "Known, tracked debt — see README.md — not a merge blocker:"
+          echo "Informational only, not a merge blocker (see docs/adr/0014 — expected to print 'None found' now that every image is pinned; a hit here means a new/edited service line skipped the digest pin):"
           grep -n "image:" docker-compose.unified.yml | grep -v "@sha256:" || echo "None found."

@@ -135,6 +135,27 @@ A `backup` service snapshots FalkorDB and mirrors the MinIO `documents` bucket i
 
 `monitoring/alerts.yml` defines Prometheus alert rules (service down, FalkorDB unreachable, elevated LLM/ingest/search error rates) evaluated by the `prometheus` service — check firing alerts at http://localhost:9090/alerts. These are rules only, with no Alertmanager/notification channel wired up yet — see [docs/adr/0007-prometheus-alert-rules.md](docs/adr/0007-prometheus-alert-rules.md).
 
+Every externally-pulled image in `docker-compose.unified.yml` is pinned by digest (`image:tag@sha256:...`), not just a floating tag — a re-pull (fresh clone, `docker compose pull`, a rebuild elsewhere) can't silently land a different image than what was actually tested. See [docs/adr/0014-image-pinning.md](docs/adr/0014-image-pinning.md).
+
+## Testing
+
+```bash
+# CI-gated unit tests (mocked, no live stack needed) — same suite .github/workflows/ci.yml runs
+docker run --rm -v "$(pwd)/proxy:/app" -w /app eedgeai-proxy \
+  python -m unittest tests/test_collection_metadata.py tests/test_governance.py -v
+
+# Live integration tests (needs the stack up, GCOR_API_KEY set) — post-deploy checks, not CI-gated
+docker exec eedgeai-proxy-1 python3 -m unittest tests.test_ingest -v
+```
+
+`.github/workflows/ci.yml` gates every push/PR to `master` on validating `docker-compose.unified.yml`, a syntax check across every tracked `.py` file, the mocked unit suites above (`proxy/tests/`, `openwebui-functions/tests/`), and an informational (non-blocking) report of any image reference missing a digest pin. See [docs/adr/0005-ci-release-gate.md](docs/adr/0005-ci-release-gate.md).
+
+`proxy/tests/test_ingest.py` and `test_openwebui_stream_smoke.py` are deliberately excluded from the CI gate — they need a real running stack (a live Graphiti/FalkorDB, real extraction) rather than mocks, so they're post-deploy checks: run them by hand against a running deployment (`docker exec eedgeai-proxy-1 ...` above) whenever you want to verify ingest → search → delete actually works end-to-end, not just that the code compiles.
+
+## Data governance
+
+Every ingested chunk carries `access_level` (`public` | `restricted` | `agent:<agent_id>`), `confidence`, and `valid_from`/`valid_to`, set at ingestion and enforced at retrieval by `_filter_hits()` in `proxy/main.py`. `proxy/governance.py` is the single source of truth for what a valid `access_level` looks like (`validate_access_level()`) — an invalid or misspelled value is rejected at ingest time rather than silently falling through as public. `valid_from`/`valid_to` are informational only (shown in citations, used as a belief-conflict tiebreaker) — they are not used to hide search results based on wall-clock time; a Graphiti fact whose extracted validity window has passed (e.g. a document reporting on a past quarter) remains permanently searchable, since a fact's own historical period doesn't make it stop being true. See [docs/adr/0004-data-governance-schema.md](docs/adr/0004-data-governance-schema.md) and [docs/adr/0019-search-staleness-was-a-test-fixture-bug.md](docs/adr/0019-search-staleness-was-a-test-fixture-bug.md).
+
 ## Configuration
 
 See `.env.example`. The important settings are `GRAPHITI_API_BASE_URL`, `GRAPHITI_MODEL`, `GRAPHITI_EMBEDDING_MODEL`, `GRAPHITI_EMBEDDING_DIM`, `GRAPHITI_GROUP_ID`, and `GRAPHITI_CHAT_SESSIONS_GROUP_ID` (the separate group chat sessions are archived into). `GRAPHITI_LLM_BASE_URL` / `GRAPHITI_LLM_API_KEY` / `GRAPHITI_LLM_MODEL` control entity/edge extraction specifically (default: routed through openclaw, separate from the Ollama-backed embeddings above — see [docs/adr/0010-graphiti-openclaw-llm.md](docs/adr/0010-graphiti-openclaw-llm.md)). `GRAPHITI_INGEST_TIMEOUT_SECONDS` (default 1800) caps how long the proxy waits for Graphiti extraction before returning an error. `GCOR_API_KEY`, `WEBUI_SECRET_KEY`, `FALKORDB_PASSWORD`, and `GRAFANA_ADMIN_PASSWORD` are the credentials to set before this stack is reachable beyond an isolated dev box — see [Authentication](#authentication). Do not commit `.env` or credentials.
