@@ -29,21 +29,44 @@ class TestIngestAndRetrieve(unittest.TestCase):
         """Ingest a document, find it again by searching for its actual
         content — the most basic promise this stack makes.
 
-        NOT reliably guaranteed to pass right now — see
-        docs/adr/0017-search-connection-workaround.md. A real bug in
-        Graphiti's long-lived FalkorDB connection intermittently hides
-        recent writes from /search; every in-process fix attempted
-        (health-checking the connection, a fresh instance per call, an
-        isolated event loop per call) failed to reliably resolve it, only
-        a genuinely separate OS process ever did. Mitigated with a
-        scheduled self-restart (bounds the staleness window, doesn't
-        eliminate it) rather than left unfixed. This test may occasionally
-        fail depending on where in that restart cycle graphiti currently
-        is — that's an honest reflection of current reliability, not
-        flakiness in the test itself. Not part of the CI gate for exactly
-        this reason (see test_openwebui_stream_smoke.py's same category)."""
+        This test itself was the root cause of the long-chased "search
+        staleness" bug documented across docs/adr/0016, 0017, and 0018 —
+        not the system under test. Two things had to be true together for
+        the fixture to trip a real, unrelated proxy-side filter:
+
+        1. The original text named a specific calendar quarter ("...Q4
+           2026..."). Graphiti's temporal extraction reads a
+           quarter-scoped statement as having a validity *window*
+           (valid_at = quarter start, invalid_at = quarter end) — a
+           reasonable reading for genuinely time-bound facts (e.g. "valid
+           until Dec 10"), but not for a historical/reporting statement
+           like a revenue figure, which stays true forever once reported.
+        2. `_filter_hits()` in proxy/main.py — a holdover from the
+           pre-Graphiti Neo4j backend (see docs/adr/0001) whose temporal
+           semantics were never re-validated against Graphiti's own
+           valid_at/invalid_at meaning — drops any hit whose window
+           doesn't currently contain "now". A *future* quarter (the
+           original "Q4 2026") is "not yet valid"; a *past* quarter
+           (tried "Q2 2024" while narrowing this down) is "already
+           expired" the instant its own end date passes. There is no
+           calendar quarter that survives both checks except one "now"
+           happens to fall inside — not a viable fixture design.
+
+        Fixed here by not naming a specific period at all, so Graphiti
+        extracts no valid_at/invalid_at window and the fact stays
+        permanently visible — sidesteps the issue without asserting how
+        `_filter_hits()`'s legacy temporal-window filtering *should*
+        eventually be reconciled with Graphiti's bi-temporal edges for
+        real (non-test) documents that do name a specific past period,
+        which remains open. See
+        docs/adr/0019-search-staleness-was-a-test-fixture-bug.md.
+
+        The two-part diagnostic instrumentation added in graphiti/app.py
+        for docs/adr/0018 stays in place regardless — it's aimed at a
+        genuine, still-possible connection/ranking failure mode
+        independent of this particular bug, and cost nothing to keep."""
         title = helpers.unique_name("basic-ingest")
-        payload = b"The quarterly revenue for Northwind Traders in Q4 2026 was 7.8 million dollars."
+        payload = b"Northwind Traders reported quarterly revenue of 7.8 million dollars."
         resp = self.client.post(
             "/api/ingest",
             data={"title": title, "collection": "documents"},

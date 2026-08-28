@@ -244,6 +244,7 @@ def create_graphiti() -> Graphiti:
 
 
 SEARCH_RESTART_INTERVAL_SECONDS = int(os.getenv("SEARCH_RESTART_INTERVAL_SECONDS", str(15 * 60)))
+_PROCESS_STARTED_AT = time.monotonic()
 
 
 async def _periodic_self_restart():
@@ -347,6 +348,130 @@ async def add_messages(request: AddMessagesRequest):
     return {"success": True, "message": "Messages ingested"}
 
 
+def _parse_iso(value) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+async def _diagnose_search_staleness(
+    group_ids: list[str] | None, query: str, returned_edges: list,
+) -> None:
+    """Best-effort diagnostic for docs/adr/0017/0018's still-unresolved
+    search bug. An extensive investigation ruled out module-level caching,
+    event-loop reuse, FalkorDB-wrapper connection pooling, raw FalkorDB
+    write-then-read consistency (instant, verified directly via
+    redis-cli), vector-index lag (none exists), the falkordb client's
+    compact-protocol schema cache (self-heals every call), and a
+    cosine-threshold miss.
+
+    Checks two different, independent things on every search:
+
+    1. **Raw DB-level visibility** (query-independent): for this group's
+       most recently created episode, can this connection see *any* edge
+       sourced from it via a direct MATCH? Ingestion extracts
+       synchronously, so a >30s-old episode with visibly zero edges from
+       it is a genuine connection-staleness signal — the classic ADR 0017
+       shape.
+    2. **Search-level omission** (only meaningful when #1 finds edges, and
+       only checked for an episode created in roughly the last 2 minutes):
+       if the latest episode *does* have edges that this connection can
+       see directly, were any of those specific edge uuids present
+       anywhere in the `search()` call's own actual results? First real
+       capture with this instrumentation live (docs/adr/0018): a test
+       failed exactly this way — the latest episode's edges existed and
+       were confirmed retrievable by a direct MATCH (so #1 didn't fire),
+       yet none of them appeared in `search()`'s output for a query that
+       was directly, strongly relevant to them (cosine ~0.89, matching
+       keywords). That rules out connection staleness for *that*
+       occurrence and points at something inside graphiti-core's own
+       hybrid-search/RRF-fusion path instead.
+
+       CAUGHT A FALSE POSITIVE from this check the same session it shipped:
+       an unrelated real chat query against an old, unrelated "latest
+       episode" — no relevance between query and episode content is ever
+       verified, so without a recency gate this fires on nearly every
+       search in any populated multi-document collection (the group's one
+       "most recent" episode is almost never what an arbitrary later query
+       is actually about). The 2-minute gate keeps this scoped to the
+       actual scenario that matters — search run shortly after its own
+       target content was ingested — where relevance is very likely, not
+       merely possible. Still not proof, just a much better-scoped signal;
+       treat a hit as a lead to investigate, not a confirmed bug.
+
+    Never raises — a failure here must never affect the real response."""
+    try:
+        records, _, _ = await app.state.graphiti.driver.execute_query(
+            "MATCH (ep:Episodic) WHERE ep.group_id IN $group_ids "
+            "WITH ep ORDER BY ep.created_at DESC LIMIT 1 "
+            "OPTIONAL MATCH (:Entity)-[e:RELATES_TO]->(:Entity) "
+            "WHERE ep.uuid IN e.episodes "
+            "RETURN ep.uuid AS episode_uuid, ep.name AS episode_name, "
+            "ep.created_at AS episode_created_at, collect(e.uuid) AS edge_uuids_from_episode",
+            group_ids=group_ids or [],
+        )
+        if not records or not records[0].get("episode_uuid"):
+            return  # group has no episodes at all — nothing to check
+        row = records[0]
+        edge_uuids_from_episode = [u for u in (row.get("edge_uuids_from_episode") or []) if u]
+        uptime_s = time.monotonic() - _PROCESS_STARTED_AT
+        created_at = _parse_iso(row.get("episode_created_at"))
+        age_s = (
+            (datetime.now(timezone.utc) - created_at).total_seconds()
+            if created_at is not None else None
+        )
+
+        if not edge_uuids_from_episode:
+            if age_s is not None and age_s < 30:
+                return  # extraction may legitimately still be in flight
+            logger.warning(
+                "search-staleness suspect (connection-level): this "
+                "connection sees 0 facts sourced from group_ids=%s's most "
+                "recent episode (uuid=%s name=%r created_at=%s age_s=%s), "
+                "even though extraction should be long done. "
+                "process_uptime_s=%.1f search_restart_interval_s=%d — see "
+                "docs/adr/0017.",
+                group_ids, row.get("episode_uuid"), row.get("episode_name"),
+                row.get("episode_created_at"), age_s, uptime_s,
+                SEARCH_RESTART_INTERVAL_SECONDS,
+            )
+            return
+
+        # Data demonstrably exists and is directly visible. Only worth
+        # cross-checking against search()'s own results when the episode
+        # is recent enough that this query is plausibly *about* it —
+        # otherwise "the group's single most-recent episode's facts don't
+        # rank for an unrelated later query" is normal, not a bug (caught
+        # this producing exactly that false positive in real traffic the
+        # same session it shipped, before this gate was added).
+        if age_s is None or age_s >= 120:
+            return
+        returned_uuids = {getattr(edge, "uuid", None) for edge in returned_edges}
+        missing = [u for u in edge_uuids_from_episode if u not in returned_uuids]
+        if missing:
+            logger.warning(
+                "search-ranking suspect, UNVERIFIED relevance (NOT "
+                "connection-level — data is directly visible): "
+                "group_ids=%s's most recent episode (uuid=%s name=%r "
+                "age_s=%.1f) has %d edge(s) confirmed retrievable by a "
+                "direct MATCH, but %d of them did not appear anywhere in "
+                "this search()'s own %d result(s) for query=%r. Worth "
+                "investigating, not confirmed — this query's relevance to "
+                "that episode's content is not verified here. See "
+                "docs/adr/0018. process_uptime_s=%.1f",
+                group_ids, row.get("episode_uuid"), row.get("episode_name"),
+                age_s, len(edge_uuids_from_episode), len(missing),
+                len(returned_edges), query, uptime_s,
+            )
+    except Exception:
+        # Diagnostic-only: never let this check affect the real response,
+        # and don't spam warnings about the check itself failing.
+        logger.debug("search-staleness diagnostic check itself failed", exc_info=True)
+
+
 @app.post("/search")
 async def search(request: SearchQuery):
     # NOTE: tried several in-process fixes for a real, confirmed bug here
@@ -367,6 +492,7 @@ async def search(request: SearchQuery):
         )
         SEARCH_REQUESTS.labels(status="success").inc()
         SEARCH_FACTS.observe(len(edges))
+        await _diagnose_search_staleness(request.group_ids, request.query, edges)
     except Exception:
         SEARCH_REQUESTS.labels(status="error").inc()
         raise
