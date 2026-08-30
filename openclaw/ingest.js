@@ -227,6 +227,42 @@ function md5Uuid(str) {
   return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20,32)}`;
 }
 
+// ── Idempotency ──────────────────────────────────────────────────────────────
+// Unlike proxy/main.py's /api/ingest (docs/adr/0012 — an in-memory,
+// short-TTL cache, viable there because the proxy is one long-lived
+// server process), ingest-cli is a fresh short-lived process every
+// invocation, so there's no in-process cache to reuse across retries.
+// Found the hard way: without this, an agent retrying after a transient
+// failure (e.g. openclaw lane contention during the slow Graphiti-side
+// extraction call) got a *new* documentId every time (the old code hashed
+// in Date.now()), silently leaving orphaned MinIO uploads with no
+// matching Graphiti episode behind each failed attempt — see
+// docs/adr/0021-openclaw-ingest-cli-hardening.md.
+//
+// Fixed by deriving documentId from content (not time) — so retrying the
+// *same* file/title/collection always computes the same id — and
+// checking Graphiti directly for an existing episode carrying that id
+// before ingesting again. This makes a retry of an already-succeeded
+// attempt a safe no-op instead of a duplicate.
+
+async function findExistingIngest(groupId, documentId) {
+  try {
+    const response = await fetch(
+      `${GRAPHITI_URL}/episodes/${encodeURIComponent(groupId)}?last_n=500`
+    );
+    if (!response.ok) return null;
+    const episodes = await response.json();
+    const matches = episodes.filter(
+      (ep) => typeof ep.content === 'string' && ep.content.includes(`Document ID: ${documentId}`)
+    );
+    return matches.length > 0 ? matches.length : null;
+  } catch {
+    // Best-effort: if the check itself fails, fall through to a normal
+    // ingest attempt rather than blocking on it.
+    return null;
+  }
+}
+
 async function graphitiIngest(groupId, chunks, documentId, title, source, agentId, accessLevel) {
   const timestamp = new Date().toISOString();
   const messages = chunks.map((content, position) => ({
@@ -306,7 +342,28 @@ async function graphitiIngest(groupId, chunks, documentId, title, source, agentI
       process.exit(1);
     }
 
-    const documentId = md5Uuid(`${source}-${Date.now()}`).replace(/-/g, '').slice(0, 16);
+    // Content-derived, not Date.now()-derived: retrying the same file with
+    // the same title/collection must compute the same id, so
+    // findExistingIngest() below can actually recognize a retry instead of
+    // creating a fresh orphaned upload every time. See the idempotency
+    // comment above graphitiIngest().
+    const contentHash = crypto.createHash('sha256').update(rawBuffer)
+      .update('\0').update(collection).update('\0').update(title).digest('hex');
+    const documentId = md5Uuid(contentHash).replace(/-/g, '').slice(0, 16);
+
+    const existingCount = await findExistingIngest(collection, documentId);
+    if (existingCount !== null) {
+      process.stderr.write(
+        `[ingest] "${title}" already ingested as ${documentId} ` +
+        `(${existingCount} episode(s) found in "${collection}") — skipping duplicate\n`
+      );
+      process.stdout.write(JSON.stringify({
+        status: 'ok', document_id: documentId, title, source,
+        chunks: existingCount, graphiti_episodes: existingCount,
+        collection, deduplicated: true,
+      }, null, 2) + '\n');
+      return;
+    }
 
     process.stderr.write(`[ingest] "${title}" → ${textChunks.length} chunks\n`);
     if (_imageMetadata) {
@@ -323,7 +380,9 @@ async function graphitiIngest(groupId, chunks, documentId, title, source, agentI
       }
     }
 
-    // MinIO — best-effort original-file copy, same convention proxy/main.py uses
+    // MinIO — best-effort original-file copy, same convention proxy/main.py uses.
+    // Same (now content-derived) documentId on a retry means this PUTs to
+    // the same key rather than creating another orphaned copy.
     const storageFilename = filePath
       ? path.basename(filePath)
       : `${title.replace(/[^\w.\-]+/g, '_') || 'stdin'}.txt`;
