@@ -61,6 +61,21 @@ jobs:
       - name: Run unit tests
         run: python -m unittest openwebui-functions/tests/test_gcor_chat_session_ingest.py -v
 
+  openclaw-ingest-tests:
+    name: openclaw ingest-cli unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Run unit tests (node's built-in test runner — no extra deps)
+        # Pure-logic only (chunking, content-hash id derivation, the
+        # idempotency match rule) — no MinIO/Graphiti network calls, see
+        # docs/adr/0021-openclaw-ingest-cli-hardening.md for the manual
+        # end-to-end verification those needed instead.
+        run: node --test openclaw/ingest.test.js
+
   image-pin-report:
     name: Report unpinned image tags (informational, non-blocking)
     runs-on: ubuntu-latest

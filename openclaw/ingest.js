@@ -245,6 +245,21 @@ function md5Uuid(str) {
 // before ingesting again. This makes a retry of an already-succeeded
 // attempt a safe no-op instead of a duplicate.
 
+// Extracted as its own pure function so the matching rule itself — not
+// just the network round-trip around it — is directly unit-testable.
+function episodeMatchesDocumentId(episode, documentId) {
+  return typeof episode?.content === 'string' && episode.content.includes(`Document ID: ${documentId}`);
+}
+
+// Content-derived, not Date.now()-derived: retrying the same file with the
+// same title/collection must compute the same id, so findExistingIngest()
+// can actually recognize a retry instead of treating it as a new document.
+function computeDocumentId(rawBuffer, collection, title) {
+  const contentHash = crypto.createHash('sha256').update(rawBuffer)
+    .update('\0').update(collection).update('\0').update(title).digest('hex');
+  return md5Uuid(contentHash).replace(/-/g, '').slice(0, 16);
+}
+
 async function findExistingIngest(groupId, documentId) {
   try {
     const response = await fetch(
@@ -252,9 +267,7 @@ async function findExistingIngest(groupId, documentId) {
     );
     if (!response.ok) return null;
     const episodes = await response.json();
-    const matches = episodes.filter(
-      (ep) => typeof ep.content === 'string' && ep.content.includes(`Document ID: ${documentId}`)
-    );
+    const matches = episodes.filter((ep) => episodeMatchesDocumentId(ep, documentId));
     return matches.length > 0 ? matches.length : null;
   } catch {
     // Best-effort: if the check itself fails, fall through to a normal
@@ -285,8 +298,10 @@ async function graphitiIngest(groupId, chunks, documentId, title, source, agentI
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
+// Guarded so this file can be `require()`d (e.g. by ingest.test.js) without
+// immediately running the CLI against real argv/stdin/network.
 
-(async () => {
+async function main() {
   try {
     if (!filePath && !useStdin) {
       const help = [
@@ -342,14 +357,7 @@ async function graphitiIngest(groupId, chunks, documentId, title, source, agentI
       process.exit(1);
     }
 
-    // Content-derived, not Date.now()-derived: retrying the same file with
-    // the same title/collection must compute the same id, so
-    // findExistingIngest() below can actually recognize a retry instead of
-    // creating a fresh orphaned upload every time. See the idempotency
-    // comment above graphitiIngest().
-    const contentHash = crypto.createHash('sha256').update(rawBuffer)
-      .update('\0').update(collection).update('\0').update(title).digest('hex');
-    const documentId = md5Uuid(contentHash).replace(/-/g, '').slice(0, 16);
+    const documentId = computeDocumentId(rawBuffer, collection, title);
 
     const existingCount = await findExistingIngest(collection, documentId);
     if (existingCount !== null) {
@@ -413,4 +421,12 @@ async function graphitiIngest(groupId, chunks, documentId, title, source, agentI
     process.stderr.write(JSON.stringify({ error: err.message }) + '\n');
     process.exit(1);
   }
-})();
+}
+
+if (require.main === module) {
+  main();
+}
+
+module.exports = {
+  parseArgs, chunkText, md5Uuid, computeDocumentId, episodeMatchesDocumentId,
+};
