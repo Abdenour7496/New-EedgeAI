@@ -37,12 +37,44 @@ const http    = require('http');
 const https   = require('https');
 const crypto  = require('crypto');
 const { Client: MinioClient } = require('minio');
+const { Agent: UndiciAgent } = require('undici');
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
 const DEFAULT_ACCESS  = process.env.DEFAULT_ACCESS_LEVEL || 'public';
 const DEFAULT_COLLECTION = process.env.GRAPHITI_GROUP_ID || 'documents';
 const GRAPHITI_URL        = (process.env.GRAPHITI_URL || 'http://graphiti:8000').replace(/\/$/, '');
+
+// Same env var name proxy/main.py already uses for the equivalent /api/ingest
+// timeout (docs/adr/0010), so both ingestion paths share one documented knob.
+//
+// Node's global fetch() has no *effective* timeout override via the plain
+// `signal: AbortSignal.timeout(...)` option here — that only bounds how long
+// *this code* waits; it does not touch undici's own dispatcher-level
+// headersTimeout/bodyTimeout, which default to 300s and fire independently,
+// closing the connection out from under the AbortSignal. Learned this the
+// hard way: set an AbortSignal.timeout(1800000) first, it changed nothing —
+// two more ingest-cli runs still failed with a generic "fetch failed" at
+// almost exactly 300s, with nothing landing in Graphiti either time (not a
+// Graphiti/openclaw error — Graphiti's own extraction was still genuinely
+// in progress server-side, per its "LLM response...defaulting" hotfix log
+// appearing with no matching completion log). Graphiti's own multi-step
+// extraction (extract_nodes -> dedupe -> extract_edges -> dedupe, each a
+// separate LLM call, serialized behind the shared openclaw concurrency lane
+// per docs/adr/0012) can legitimately take longer than 300s even for a
+// single small chunk under real load — this just needs to outlast that, not
+// work around it. The actual fix is the dedicated undici Agent below, with
+// headersTimeout/bodyTimeout set explicitly; the AbortSignal stays too, as
+// an outer backstop.
+const GRAPHITI_INGEST_TIMEOUT_SECONDS = parseInt(process.env.GRAPHITI_INGEST_TIMEOUT_SECONDS || '1800', 10);
+
+// Dedicated dispatcher (not the global default) so only Graphiti calls get
+// this much patience — other fetch() calls in this file (S3-adjacent, the
+// idempotency check's own GET) keep undici's normal defaults.
+const graphitiDispatcher = new UndiciAgent({
+  headersTimeout: GRAPHITI_INGEST_TIMEOUT_SECONDS * 1000,
+  bodyTimeout: GRAPHITI_INGEST_TIMEOUT_SECONDS * 1000,
+});
 
 // Document storage (MinIO, S3-compatible) — same bucket/key convention as
 // proxy/main.py's _store_original_to_s3, so a document ingested via either
@@ -292,6 +324,8 @@ async function graphitiIngest(groupId, chunks, documentId, title, source, agentI
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ group_id: groupId, messages }),
+    signal: AbortSignal.timeout(GRAPHITI_INGEST_TIMEOUT_SECONDS * 1000),
+    dispatcher: graphitiDispatcher,
   });
   if (!response.ok) throw new Error(`Graphiti ingest failed (${response.status}): ${await response.text()}`);
   return messages.length;

@@ -16,6 +16,7 @@ from falkordb.asyncio import FalkorDB
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 from graphiti_core.edges import EntityEdge
+from graphiti_core.errors import GroupsEdgesNotFoundError
 from graphiti_core.llm_client.config import LLMConfig
 from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
@@ -525,6 +526,20 @@ async def get_episodes(group_id: str, last_n: int = 100):
     return [episode.model_dump(mode="json") for episode in episodes]
 
 
+async def _get_edges_by_group_ids_safe(driver, group_ids: list[str]) -> list[EntityEdge]:
+    """EntityEdge.get_by_group_ids() raises GroupsEdgesNotFoundError instead
+    of returning an empty list when a group has zero edges — a real, live
+    case (e.g. an episode whose extraction produced no facts, or one
+    already fully cleaned up). Every /episode, /admin/gc-orphaned-edges,
+    and /group delete path below needs "no edges" to mean "nothing to do",
+    not a 500. Hit this repeatedly on real test episodes before fixing it
+    here rather than working around it at each call site again."""
+    try:
+        return await EntityEdge.get_by_group_ids(driver, group_ids)
+    except GroupsEdgesNotFoundError:
+        return []
+
+
 @app.delete("/episode/{episode_uuid}")
 async def delete_episode(episode_uuid: str):
     """Delete one episode AND the facts (EntityEdge) it's the sole source
@@ -549,7 +564,7 @@ async def delete_episode(episode_uuid: str):
     except Exception as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    edges = await EntityEdge.get_by_group_ids(app.state.graphiti.driver, [episode.group_id])
+    edges = await _get_edges_by_group_ids_safe(app.state.graphiti.driver, [episode.group_id])
     edges_deleted = 0
     edges_updated = 0
     for edge in edges:
@@ -582,7 +597,7 @@ async def gc_orphaned_edges(group_id: str):
     but isn't empty, leave it untouched otherwise. Safe to run repeatedly
     — a clean group does no writes.
     """
-    edges = await EntityEdge.get_by_group_ids(app.state.graphiti.driver, [group_id])
+    edges = await _get_edges_by_group_ids_safe(app.state.graphiti.driver, [group_id])
     episodes = await EpisodicNode.get_by_group_ids(app.state.graphiti.driver, [group_id])
     live_episode_uuids = {e.uuid for e in episodes}
 
@@ -612,7 +627,7 @@ async def gc_orphaned_edges(group_id: str):
 @app.delete("/group/{group_id}")
 async def delete_group(group_id: str):
     episodes = await EpisodicNode.get_by_group_ids(app.state.graphiti.driver, [group_id])
-    edges = await EntityEdge.get_by_group_ids(app.state.graphiti.driver, [group_id])
+    edges = await _get_edges_by_group_ids_safe(app.state.graphiti.driver, [group_id])
     for edge in edges:
         await edge.delete(app.state.graphiti.driver)
     for episode in episodes:
