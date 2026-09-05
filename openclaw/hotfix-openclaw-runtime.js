@@ -8,6 +8,12 @@ const distDir = "/app/dist";
 // different provider. Guards the error message path so that only messages from
 // the current provider/model context are surfaced.
 //
+// ≥ 2026.8.1: params.timedOut/idleTimedOut replaced by
+//             params.terminal.kind/source; gained a providerOwner field.
+//             Verified the underlying bug (lastAssistant's formatted error
+//             used regardless of whether its provider/model still matches
+//             the current fallback context) is still present at this
+//             version — not upstream-fixed, still needs this patch.
 // ≥ 2026.6.7: bundle renamed pi-embedded-* → embedded-agent-*; function gained
 //             authMode and idleTimedOut params — target the new signature.
 // ≥ 2026.5.7: upstream extracted the inline expression into a dedicated
@@ -40,8 +46,36 @@ if (!target) {
     return true;
   }
 
+  // Tried newest-signature-first; each attempt only runs once the ones
+  // before it have failed, and none run again once one has succeeded —
+  // `source` only ever contains one signature at a time, so once a match
+  // is found the older patterns can't match it anyway, but skipping them
+  // outright avoids printing confusing "not found" warnings for patterns
+  // that were never going to apply.
+  let fallbackGuardPatched = false;
+
+  // ≥ 2026.8.1: params.timedOut/idleTimedOut → params.terminal.kind/source;
+  // gained a providerOwner field passed through to formatAssistantErrorText.
+  fallbackGuardPatched = replaceOne(
+    "fallback message guard (resolveAssistantFailoverErrorMessage with terminal.kind/providerOwner)",
+    /function resolveAssistantFailoverErrorMessage\(params\) \{\n\tconst timeoutFailure = params\.terminal\.kind === "timeout" && params\.terminal\.source !== "observation";\n\treturn \(params\.lastAssistant \? formatAssistantErrorText\(params\.lastAssistant, \{\n\t\tcfg: params\.config,\n\t\tsessionKey: params\.sessionKey,\n\t\tprovider: params\.activeErrorContext\.provider,\n\t\tproviderOwner: params\.providerOwner,\n\t\tmodel: params\.activeErrorContext\.model,\n\t\tauthMode: params\.authMode\n\t\}\) : void 0\) \|\| params\.lastAssistant\?\.errorMessage\?\.trim\(\) \|\| \(timeoutFailure \? "LLM request timed out\." : params\.rateLimitFailure \? "LLM request rate limited\." : params\.billingFailure \? formatBillingErrorMessage\(params\.activeErrorContext\.provider, params\.activeErrorContext\.model, params\.authMode\) : params\.authFailure \? "LLM request unauthorized\." : "LLM request failed\."\);\n\}/,
+    `function resolveAssistantFailoverErrorMessage(params) {
+	const timeoutFailure = params.terminal.kind === "timeout" && params.terminal.source !== "observation";
+	const assistantErrorContextMatchesInFallback = (!params.lastAssistant?.provider || params.activeErrorContext.provider === params.lastAssistant.provider) && (!params.lastAssistant?.model || params.activeErrorContext.model === params.lastAssistant.model);
+	const rawFallbackErrorMessage = assistantErrorContextMatchesInFallback ? params.lastAssistant?.errorMessage?.trim() : void 0;
+	return (params.lastAssistant && assistantErrorContextMatchesInFallback ? formatAssistantErrorText(params.lastAssistant, {
+		cfg: params.config,
+		sessionKey: params.sessionKey,
+		provider: params.activeErrorContext.provider,
+		providerOwner: params.providerOwner,
+		model: params.activeErrorContext.model,
+		authMode: params.authMode
+	}) : void 0) || rawFallbackErrorMessage || (timeoutFailure ? "LLM request timed out." : params.rateLimitFailure ? "LLM request rate limited." : params.billingFailure ? formatBillingErrorMessage(params.activeErrorContext.provider, params.activeErrorContext.model, params.authMode) : params.authFailure ? "LLM request unauthorized." : "LLM request failed.");
+}`
+  );
+
   // ≥ 2026.6.7: function signature added authMode and idleTimedOut
-  const patchedFnNew = replaceOne(
+  if (!fallbackGuardPatched) fallbackGuardPatched = replaceOne(
     "fallback message guard (resolveAssistantFailoverErrorMessage with authMode/idleTimedOut)",
     /function resolveAssistantFailoverErrorMessage\(params\) \{\n\tconst timeoutFailure = params\.timedOut \|\| params\.idleTimedOut;\n\treturn \(params\.lastAssistant \? formatAssistantErrorText\(params\.lastAssistant, \{\n\t\tcfg: params\.config,\n\t\tsessionKey: params\.sessionKey,\n\t\tprovider: params\.activeErrorContext\.provider,\n\t\tmodel: params\.activeErrorContext\.model,\n\t\tauthMode: params\.authMode\n\t\}\) : void 0\) \|\| params\.lastAssistant\?\.errorMessage\?\.trim\(\) \|\| \(timeoutFailure \? "LLM request timed out\." : params\.rateLimitFailure \? "LLM request rate limited\." : params\.billingFailure \? formatBillingErrorMessage\(params\.activeErrorContext\.provider, params\.activeErrorContext\.model, params\.authMode\) : params\.authFailure \? "LLM request unauthorized\." : "LLM request failed\."\);\n\}/,
     `function resolveAssistantFailoverErrorMessage(params) {
@@ -58,9 +92,9 @@ if (!target) {
 }`
   );
 
-  if (!patchedFnNew) {
+  if (!fallbackGuardPatched) {
     // ≥ 2026.5.7, < 2026.6.7: resolveAssistantFailoverErrorMessage without authMode/idleTimedOut
-    const patchedFn = replaceOne(
+    fallbackGuardPatched = replaceOne(
       "fallback message guard (resolveAssistantFailoverErrorMessage)",
       /function resolveAssistantFailoverErrorMessage\(params\) \{\n\treturn \(params\.lastAssistant \? formatAssistantErrorText\(params\.lastAssistant, \{\n\t\tcfg: params\.config,\n\t\tsessionKey: params\.sessionKey,\n\t\tprovider: params\.activeErrorContext\.provider,\n\t\tmodel: params\.activeErrorContext\.model\n\t\}\) : void 0\) \|\| params\.lastAssistant\?\.errorMessage\?\.trim\(\) \|\| \(params\.timedOut \? "LLM request timed out\." : params\.rateLimitFailure \? "LLM request rate limited\." : params\.billingFailure \? formatBillingErrorMessage\(params\.activeErrorContext\.provider, params\.activeErrorContext\.model\) : params\.authFailure \? "LLM request unauthorized\." : "LLM request failed\."\);\n\}/,
       `function resolveAssistantFailoverErrorMessage(params) {
@@ -74,9 +108,9 @@ if (!target) {
 	}) : void 0) || rawFallbackErrorMessage || (params.timedOut ? "LLM request timed out." : params.rateLimitFailure ? "LLM request rate limited." : params.billingFailure ? formatBillingErrorMessage(params.activeErrorContext.provider, params.activeErrorContext.model) : params.authFailure ? "LLM request unauthorized." : "LLM request failed.");
 }`
     );
-    if (!patchedFn) {
+    if (!fallbackGuardPatched) {
       // < 2026.5.7: inline const message pattern
-      replaceOne(
+      fallbackGuardPatched = replaceOne(
         "fallback message guard (inline const message)",
         /const message = \(params\.lastAssistant \? formatAssistantErrorText\(params\.lastAssistant, \{[\s\S]*?\}\) : void 0\) \|\| params\.lastAssistant\?\.errorMessage\?\.trim\(\) \|\| \(params\.timedOut \? "LLM request timed out\." : params\.rateLimitFailure \? "LLM request rate limited\." : params\.billingFailure \? formatBillingErrorMessage\(params\.activeErrorContext\.provider, params\.activeErrorContext\.model\) : params\.authFailure \? "LLM request unauthorized\." : "LLM request failed\."\);/,
         `const assistantErrorContextMatchesInFallback = (!params.lastAssistant?.provider || params.activeErrorContext.provider === params.lastAssistant.provider) && (!params.lastAssistant?.model || params.activeErrorContext.model === params.lastAssistant.model);
@@ -91,8 +125,23 @@ if (!target) {
     }
   }
 
-  fs.writeFileSync(filePath, source, "utf8");
-  console.log(`Patched OpenClaw runtime bundle: ${filePath}`);
+  // Only write/log success if one of the attempts above actually matched —
+  // previously this ran unconditionally, so a version where every pattern
+  // had drifted still printed "Patched..." and rewrote the file unchanged,
+  // silently masking exactly the failure this warns about now. Caught this
+  // updating to 2026.8.1: all three older patterns missed (correctly
+  // warned), but the misleading unconditional log made that easy to miss
+  // in build output before this fix.
+  if (fallbackGuardPatched) {
+    fs.writeFileSync(filePath, source, "utf8");
+    console.log(`Patched OpenClaw runtime bundle: ${filePath}`);
+  } else {
+    console.warn(
+      `[hotfix] WARNING: fallback message guard patch did NOT apply to ${filePath} — ` +
+      "none of the known signatures matched. File left unmodified. " +
+      "Update hotfix-openclaw-runtime.js with a new pattern for this version."
+    );
+  }
 }
 
 // ── Patch 2: errors bundle — add GitHub Copilot premium-allowance failover ──

@@ -37,12 +37,44 @@ const http    = require('http');
 const https   = require('https');
 const crypto  = require('crypto');
 const { Client: MinioClient } = require('minio');
+const { Agent: UndiciAgent } = require('undici');
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
 const DEFAULT_ACCESS  = process.env.DEFAULT_ACCESS_LEVEL || 'public';
 const DEFAULT_COLLECTION = process.env.GRAPHITI_GROUP_ID || 'documents';
 const GRAPHITI_URL        = (process.env.GRAPHITI_URL || 'http://graphiti:8000').replace(/\/$/, '');
+
+// Same env var name proxy/main.py already uses for the equivalent /api/ingest
+// timeout (docs/adr/0010), so both ingestion paths share one documented knob.
+//
+// Node's global fetch() has no *effective* timeout override via the plain
+// `signal: AbortSignal.timeout(...)` option here — that only bounds how long
+// *this code* waits; it does not touch undici's own dispatcher-level
+// headersTimeout/bodyTimeout, which default to 300s and fire independently,
+// closing the connection out from under the AbortSignal. Learned this the
+// hard way: set an AbortSignal.timeout(1800000) first, it changed nothing —
+// two more ingest-cli runs still failed with a generic "fetch failed" at
+// almost exactly 300s, with nothing landing in Graphiti either time (not a
+// Graphiti/openclaw error — Graphiti's own extraction was still genuinely
+// in progress server-side, per its "LLM response...defaulting" hotfix log
+// appearing with no matching completion log). Graphiti's own multi-step
+// extraction (extract_nodes -> dedupe -> extract_edges -> dedupe, each a
+// separate LLM call, serialized behind the shared openclaw concurrency lane
+// per docs/adr/0012) can legitimately take longer than 300s even for a
+// single small chunk under real load — this just needs to outlast that, not
+// work around it. The actual fix is the dedicated undici Agent below, with
+// headersTimeout/bodyTimeout set explicitly; the AbortSignal stays too, as
+// an outer backstop.
+const GRAPHITI_INGEST_TIMEOUT_SECONDS = parseInt(process.env.GRAPHITI_INGEST_TIMEOUT_SECONDS || '1800', 10);
+
+// Dedicated dispatcher (not the global default) so only Graphiti calls get
+// this much patience — other fetch() calls in this file (S3-adjacent, the
+// idempotency check's own GET) keep undici's normal defaults.
+const graphitiDispatcher = new UndiciAgent({
+  headersTimeout: GRAPHITI_INGEST_TIMEOUT_SECONDS * 1000,
+  bodyTimeout: GRAPHITI_INGEST_TIMEOUT_SECONDS * 1000,
+});
 
 // Document storage (MinIO, S3-compatible) — same bucket/key convention as
 // proxy/main.py's _store_original_to_s3, so a document ingested via either
@@ -227,6 +259,55 @@ function md5Uuid(str) {
   return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20,32)}`;
 }
 
+// ── Idempotency ──────────────────────────────────────────────────────────────
+// Unlike proxy/main.py's /api/ingest (docs/adr/0012 — an in-memory,
+// short-TTL cache, viable there because the proxy is one long-lived
+// server process), ingest-cli is a fresh short-lived process every
+// invocation, so there's no in-process cache to reuse across retries.
+// Found the hard way: without this, an agent retrying after a transient
+// failure (e.g. openclaw lane contention during the slow Graphiti-side
+// extraction call) got a *new* documentId every time (the old code hashed
+// in Date.now()), silently leaving orphaned MinIO uploads with no
+// matching Graphiti episode behind each failed attempt — see
+// docs/adr/0021-openclaw-ingest-cli-hardening.md.
+//
+// Fixed by deriving documentId from content (not time) — so retrying the
+// *same* file/title/collection always computes the same id — and
+// checking Graphiti directly for an existing episode carrying that id
+// before ingesting again. This makes a retry of an already-succeeded
+// attempt a safe no-op instead of a duplicate.
+
+// Extracted as its own pure function so the matching rule itself — not
+// just the network round-trip around it — is directly unit-testable.
+function episodeMatchesDocumentId(episode, documentId) {
+  return typeof episode?.content === 'string' && episode.content.includes(`Document ID: ${documentId}`);
+}
+
+// Content-derived, not Date.now()-derived: retrying the same file with the
+// same title/collection must compute the same id, so findExistingIngest()
+// can actually recognize a retry instead of treating it as a new document.
+function computeDocumentId(rawBuffer, collection, title) {
+  const contentHash = crypto.createHash('sha256').update(rawBuffer)
+    .update('\0').update(collection).update('\0').update(title).digest('hex');
+  return md5Uuid(contentHash).replace(/-/g, '').slice(0, 16);
+}
+
+async function findExistingIngest(groupId, documentId) {
+  try {
+    const response = await fetch(
+      `${GRAPHITI_URL}/episodes/${encodeURIComponent(groupId)}?last_n=500`
+    );
+    if (!response.ok) return null;
+    const episodes = await response.json();
+    const matches = episodes.filter((ep) => episodeMatchesDocumentId(ep, documentId));
+    return matches.length > 0 ? matches.length : null;
+  } catch {
+    // Best-effort: if the check itself fails, fall through to a normal
+    // ingest attempt rather than blocking on it.
+    return null;
+  }
+}
+
 async function graphitiIngest(groupId, chunks, documentId, title, source, agentId, accessLevel) {
   const timestamp = new Date().toISOString();
   const messages = chunks.map((content, position) => ({
@@ -243,14 +324,18 @@ async function graphitiIngest(groupId, chunks, documentId, title, source, agentI
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ group_id: groupId, messages }),
+    signal: AbortSignal.timeout(GRAPHITI_INGEST_TIMEOUT_SECONDS * 1000),
+    dispatcher: graphitiDispatcher,
   });
   if (!response.ok) throw new Error(`Graphiti ingest failed (${response.status}): ${await response.text()}`);
   return messages.length;
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
+// Guarded so this file can be `require()`d (e.g. by ingest.test.js) without
+// immediately running the CLI against real argv/stdin/network.
 
-(async () => {
+async function main() {
   try {
     if (!filePath && !useStdin) {
       const help = [
@@ -306,7 +391,21 @@ async function graphitiIngest(groupId, chunks, documentId, title, source, agentI
       process.exit(1);
     }
 
-    const documentId = md5Uuid(`${source}-${Date.now()}`).replace(/-/g, '').slice(0, 16);
+    const documentId = computeDocumentId(rawBuffer, collection, title);
+
+    const existingCount = await findExistingIngest(collection, documentId);
+    if (existingCount !== null) {
+      process.stderr.write(
+        `[ingest] "${title}" already ingested as ${documentId} ` +
+        `(${existingCount} episode(s) found in "${collection}") — skipping duplicate\n`
+      );
+      process.stdout.write(JSON.stringify({
+        status: 'ok', document_id: documentId, title, source,
+        chunks: existingCount, graphiti_episodes: existingCount,
+        collection, deduplicated: true,
+      }, null, 2) + '\n');
+      return;
+    }
 
     process.stderr.write(`[ingest] "${title}" → ${textChunks.length} chunks\n`);
     if (_imageMetadata) {
@@ -323,7 +422,9 @@ async function graphitiIngest(groupId, chunks, documentId, title, source, agentI
       }
     }
 
-    // MinIO — best-effort original-file copy, same convention proxy/main.py uses
+    // MinIO — best-effort original-file copy, same convention proxy/main.py uses.
+    // Same (now content-derived) documentId on a retry means this PUTs to
+    // the same key rather than creating another orphaned copy.
     const storageFilename = filePath
       ? path.basename(filePath)
       : `${title.replace(/[^\w.\-]+/g, '_') || 'stdin'}.txt`;
@@ -354,4 +455,12 @@ async function graphitiIngest(groupId, chunks, documentId, title, source, agentI
     process.stderr.write(JSON.stringify({ error: err.message }) + '\n');
     process.exit(1);
   }
-})();
+}
+
+if (require.main === module) {
+  main();
+}
+
+module.exports = {
+  parseArgs, chunkText, md5Uuid, computeDocumentId, episodeMatchesDocumentId,
+};

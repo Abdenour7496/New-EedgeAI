@@ -10,8 +10,11 @@ Architecture
 
 This replaced an earlier Neo4j + Qdrant dual-write design — see
 docs/adr/0001-graphiti-falkordb-backend.md for the migration rationale.
-Confidence filtering, temporal validity, and agent/access-level partitioning
-are still applied client-side in _filter_hits() over Graphiti's results.
+Confidence filtering and agent/access-level partitioning are still applied
+client-side in _filter_hits() over Graphiti's results. A third,
+wall-clock-based temporal-validity filter used to run there too — removed,
+see docs/adr/0019-search-staleness-was-a-test-fixture-bug.md and
+_filter_hits()'s own docstring for why.
 
 ─────────────────────────────────────────────────────────────────────────────
 Retrieval flow for every /v1/chat/completions request
@@ -23,7 +26,7 @@ Retrieval flow for every /v1/chat/completions request
 
   2. HYBRID RETRIEVAL  (Graphiti / FalkorDB)
      graphiti_search() → temporal facts, min-max normalised and filtered by
-     score, confidence, temporal validity, and access control (_filter_hits)
+     score, confidence, and access control (_filter_hits)
 
   3. REFLECTION CHECK
      No graph records but facts exist → fall back to fact text
@@ -36,8 +39,6 @@ Other endpoints
 ───────────────
   GET  /v1/models              → live OpenAI model list (with fallback)
   POST /v1/embeddings          → proxied to OpenAI
-  POST /v1/buzz/chat/completions → bearer-authenticated GCOR entry point for the
-                                    Buzz collaboration bridge (see BUZZ_BRIDGE_API_KEY)
   GET  /health                 → liveness check
 """
 
@@ -51,6 +52,7 @@ import re
 import time
 import uuid
 from datetime import datetime, timezone
+from urllib.parse import unquote
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
@@ -295,28 +297,6 @@ async def graphiti_ingest(
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.0"))
 # Agent id scopes memory/belief/inference retrieval to a single partition
 AGENT_ID = os.getenv("AGENT_ID", "")
-
-# ── Buzz bridge (optional --profile buzz integration) ─────────────────────────
-# Shared secret the buzz-agent-bridge container presents on /v1/buzz/chat/completions.
-# That route is reachable from the Buzz relay's channel traffic (humans + agents),
-# a less-trusted source than the internal-network-only /v1/chat/completions, so it
-# is closed (503) unless this is explicitly set.
-BUZZ_BRIDGE_API_KEY = os.getenv("BUZZ_BRIDGE_API_KEY", "")
-# Optional allowlist restricting which collections Buzz-originated queries may target.
-# Empty = no restriction beyond what /v1/chat/completions already allows.
-BUZZ_ALLOWED_COLLECTIONS = [
-    c.strip() for c in os.getenv("BUZZ_ALLOWED_COLLECTIONS", "").split(",") if c.strip()
-]
-BUZZ_BRIDGE_RATE_LIMIT = int(os.getenv("BUZZ_BRIDGE_RATE_LIMIT_PER_MIN", "30"))
-# buzz-acp bundles base prompt + up to BUZZ_ACP_CONTEXT_MESSAGE_LIMIT prior
-# messages + memory injection into a single message, easily tens of KB —
-# 8000 chars (initial guess) was too tight for real traffic and rejected
-# legitimate turns outright.
-BUZZ_BRIDGE_MAX_MESSAGE_CHARS = int(os.getenv("BUZZ_BRIDGE_MAX_MESSAGE_CHARS", "100000"))
-# Cap on /v1/buzz/ingest uploads — this route is reachable from Buzz channel
-# content (an image attachment or a storage_key lookup), so unlike the
-# internal-network-only /api/ingest it needs its own size ceiling.
-BUZZ_BRIDGE_MAX_UPLOAD_BYTES = int(os.getenv("BUZZ_BRIDGE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 
 # ── Document storage (MinIO, S3-compatible) ───────────────────────────────────
 # Best-effort: ingestion still works if MinIO is unreachable or unconfigured,
@@ -655,10 +635,38 @@ def _filter_hits(hits: list) -> list:
     """
     Apply cognitive filters to raw Qdrant hits:
       1. Confidence threshold — payload.confidence below minimum is discarded
-      2. Temporal validity   — expired valid_to is discarded
-      3. Access control      — access_level incompatible with AGENT_ID is discarded
+      2. Access control       — access_level incompatible with AGENT_ID is discarded
+
+    A third filter — dropping a hit whose valid_from/valid_to window didn't
+    currently contain wall-clock "now" — used to run here too. Removed: it
+    predates the Graphiti/FalkorDB backend (see docs/adr/0001) and was never
+    re-validated against Graphiti's actual valid_at/invalid_at semantics,
+    which conflate two different things under one field pair — genuine
+    supersession (a newer fact contradicts an older one — fine to hide) and
+    a validity *window* merely extracted from the source text (e.g. "Q2
+    2024 revenue") — which for a historical/reporting statement does not
+    mean the fact stops being true or citable once that window ends. In
+    practice this meant any document mentioning a specific past or future
+    date/period became permanently unsearchable — found and root-caused via
+    docs/adr/0019-search-staleness-was-a-test-fixture-bug.md, which chased
+    what looked like a Graphiti/FalkorDB staleness bug for two sessions
+    before landing here. valid_from/valid_to are still passed through in
+    each hit's payload for display (citation badges, _temporal_badge()) and
+    as a belief-conflict tiebreaker (resolve_belief_conflicts()) — both
+    informational uses, not filters, and both left unchanged.
+
+    This also removes the only consumer of /api/ingest's `valid_hours`
+    parameter (an unused, dormant feature — grepped the rest of the repo,
+    no caller ever sets it): it worked, when it worked at all, by embedding
+    a "Valid until: <timestamp>" text line into the episode and hoping
+    Graphiti's LLM extraction faithfully turned that into a matching
+    invalid_at on every fact from that episode — an indirect, unverified
+    mechanism relying on the same conflated field this fix removes as a
+    filter axis. If genuine content-expiry is needed later, it deserves
+    its own explicit, structured mechanism (e.g. an episode-level property
+    checked before Graphiti's own extraction, not an LLM-inferred edge
+    field) rather than reviving this one.
     """
-    now = _now_iso()
     filtered = []
     for h in hits:
         p = h.get("payload") or {}
@@ -668,16 +676,6 @@ def _filter_hits(hits: list) -> list:
         if node_confidence is not None and node_confidence < CONFIDENCE_THRESHOLD:
             logger.debug("Dropping hit %s: confidence %.2f < %.2f",
                          h.get("id"), node_confidence, CONFIDENCE_THRESHOLD)
-            continue
-
-        # ── temporal validity ─────────────────────────────────────────────────
-        valid_to = p.get("valid_to")
-        if valid_to and valid_to < now:
-            logger.debug("Dropping hit %s: expired valid_to %s", h.get("id"), valid_to)
-            continue
-        valid_from = p.get("valid_from")
-        if valid_from and valid_from > now:
-            logger.debug("Dropping hit %s: not yet valid (valid_from %s)", h.get("id"), valid_from)
             continue
 
         # ── access control ────────────────────────────────────────────────────
@@ -1539,124 +1537,6 @@ async def openclaw_chat_completions_raw(request: Request):
     return await call_openclaw(body)
 
 
-# ── Buzz bridge ──────────────────────────────────────────────────────────────
-# In-process sliding-window limiter — the Buzz bridge is a single trusted
-# caller, this just bounds cost/blast-radius if its token ever leaks or the
-# bridge misbehaves (e.g. a workflow loop re-triggering itself).
-_buzz_rate_lock: "asyncio.Lock | None" = None
-_buzz_rate_window: list[float] = []
-
-
-async def _check_buzz_rate_limit():
-    global _buzz_rate_lock
-    if _buzz_rate_lock is None:
-        _buzz_rate_lock = asyncio.Lock()
-    now = time.monotonic()
-    async with _buzz_rate_lock:
-        while _buzz_rate_window and now - _buzz_rate_window[0] > 60:
-            _buzz_rate_window.pop(0)
-        if len(_buzz_rate_window) >= BUZZ_BRIDGE_RATE_LIMIT:
-            raise HTTPException(status_code=429, detail="Buzz bridge rate limit exceeded")
-        _buzz_rate_window.append(now)
-
-
-@app.post("/v1/buzz/chat/completions")
-async def buzz_chat_completions(request: Request):
-    """Bearer-authenticated GCOR entry point for the Buzz collaboration bridge.
-
-    Buzz channel content (human or agent authored) is a less-trusted source than
-    the rest of the internal docker network, so this route is separate from
-    /v1/chat/completions: it requires BUZZ_BRIDGE_API_KEY, caps message size,
-    optionally restricts which collection may be queried, and rate-limits.
-    """
-    if not BUZZ_BRIDGE_API_KEY:
-        raise HTTPException(status_code=503, detail="Buzz bridge is not configured")
-
-    auth = request.headers.get("authorization", "")
-    scheme, _, token = auth.partition(" ")
-    if scheme.lower() != "bearer" or not hmac.compare_digest(token, BUZZ_BRIDGE_API_KEY):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    await _check_buzz_rate_limit()
-
-    body = await request.json()
-    messages = body.get("messages", [])
-    if not isinstance(messages, list) or not messages or len(messages) > 50:
-        raise HTTPException(status_code=400, detail="Invalid messages")
-    for m in messages:
-        content = m.get("content", "") if isinstance(m, dict) else None
-        # Same two shapes last_user_text() already tolerates: a plain string, or
-        # OpenAI-style content-part blocks ([{"type": "text", "text": "..."}]) —
-        # buzz-agent's OpenAI-compat client sends the latter.
-        if isinstance(content, str):
-            text_len = len(content)
-        elif isinstance(content, list):
-            text_len = sum(
-                len(p.get("text", "")) for p in content
-                if isinstance(p, dict) and p.get("type") == "text"
-            )
-        else:
-            raise HTTPException(status_code=400, detail="Invalid message content")
-        if text_len > BUZZ_BRIDGE_MAX_MESSAGE_CHARS:
-            raise HTTPException(status_code=400, detail="Message content too long")
-
-    rag_collection = _request_rag_collection(body, request)
-    if BUZZ_ALLOWED_COLLECTIONS and rag_collection not in (None, *BUZZ_ALLOWED_COLLECTIONS):
-        raise HTTPException(status_code=403, detail="Collection not permitted for Buzz bridge")
-
-    body = {**body, "model": "openclaw"}  # always answer via the GCOR pipeline, ignore caller-supplied model
-    return await _run_chat_completion(body, rag_collection)
-
-
-@app.post("/v1/buzz/ingest")
-async def buzz_ingest(
-    request: Request,
-    background_tasks: BackgroundTasks,
-    file: UploadFile | None = File(None),
-    storage_key: str = Form(""),
-):
-    """Buzz-facing document ingestion — same trust boundary and auth as
-    /v1/buzz/chat/completions (BUZZ_BRIDGE_API_KEY, shared rate limit).
-
-    Two ways in, both used by the bridge:
-      - multipart file upload — an image attachment pulled off a Buzz message
-        (Buzz's own media pipeline only accepts images, so this is the only
-        binary content a channel can actually produce).
-      - storage_key — ingest (or re-confirm) a file that's already sitting in
-        MinIO under documents/inbox/, processed/, failed/, or originals/*/,
-        for the '@bot ingest <name>' text-reference path.
-    """
-    if not BUZZ_BRIDGE_API_KEY:
-        raise HTTPException(status_code=503, detail="Buzz bridge is not configured")
-
-    auth = request.headers.get("authorization", "")
-    scheme, _, token = auth.partition(" ")
-    if scheme.lower() != "bearer" or not hmac.compare_digest(token, BUZZ_BRIDGE_API_KEY):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    await _check_buzz_rate_limit()
-
-    if file is not None:
-        data = await file.read()
-        filename = file.filename or "upload"
-    elif storage_key.strip():
-        data, filename = await _find_and_fetch_from_s3(storage_key.strip())
-        if data is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"'{storage_key}' not found in MinIO (checked bucket root, inbox/, processed/, failed/, originals/*)",
-            )
-    else:
-        raise HTTPException(status_code=400, detail="Provide either a file or storage_key")
-
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty file")
-    if len(data) > BUZZ_BRIDGE_MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=400, detail="File too large")
-
-    return await _ingest_bytes(filename, data, background_tasks=background_tasks, enable_docint=True)
-
-
 async def _run_chat_completion(body: dict, rag_collection: str | None):
     messages = list(body.get("messages", []))
 
@@ -1847,7 +1727,8 @@ async def api_collection_docs(name: str):
 
 @app.delete("/api/collections/{name}/docs/{doc_id}")
 async def api_archive_document(name: str, doc_id: str):
-    """Delete one Graphiti episode. Source files remain preserved in MinIO.
+    """Delete one Graphiti episode AND the facts it's the sole source of.
+    Source files remain preserved in MinIO.
 
     This is a permanent deletion from the knowledge graph — Graphiti has no
     archive/restore concept (see docs/adr/0001-graphiti-falkordb-backend.md).
@@ -1858,7 +1739,12 @@ async def api_archive_document(name: str, doc_id: str):
         if response.status_code == 404:
             raise HTTPException(status_code=404, detail=f"Episode '{doc_id}' not found")
         response.raise_for_status()
-    return {"status": "deleted", "doc_id": doc_id, "collection": name}
+        graphiti_result = response.json()
+    return {
+        "status": "deleted", "doc_id": doc_id, "collection": name,
+        "edges_deleted": graphiti_result.get("edges_deleted", 0),
+        "edges_updated": graphiti_result.get("edges_updated", 0),
+    }
 
 
 @app.post("/api/collections")
@@ -1934,6 +1820,55 @@ async def api_search(
     return {"collection": collection, "query": q, "results": results}
 
 
+# ── Ingest idempotency guard ────────────────────────────────────────────────
+# Graphiti extraction can genuinely take a while (docs/adr/0003, 0010) — a
+# caller whose own timeout is shorter than the server's has no way to know
+# whether the request actually succeeded server-side. Both doc_id
+# computations below are time-based, not content-based, so a naive retry of
+# identical content creates a second, fully-duplicate Graphiti episode.
+# Reproduced directly while manually verifying ingestion: a client-side
+# ReadTimeout on a request that had actually already succeeded server-side
+# left two duplicate episodes in Graphiti for one logical submission. Cache
+# recent results by a hash of the actual submitted content, short-lived —
+# this targets "client gave up and is retrying", not general content dedup
+# (re-ingesting the same document a day later is expected to create a fresh
+# episode, e.g. to pick up an updated valid_to).
+_INGEST_IDEMPOTENCY_TTL_SECONDS = float(os.getenv("INGEST_IDEMPOTENCY_TTL_SECONDS", "600"))
+_recent_ingest_results: dict[str, tuple[float, dict]] = {}
+_ingest_idempotency_lock = asyncio.Lock()
+
+
+def _evict_stale_ingest_cache(now: float) -> None:
+    stale = [
+        key for key, (ts, _) in _recent_ingest_results.items()
+        if now - ts > _INGEST_IDEMPOTENCY_TTL_SECONDS
+    ]
+    for key in stale:
+        _recent_ingest_results.pop(key, None)
+
+
+def _ingest_idempotency_key(*parts: str | bytes) -> str:
+    h = hashlib.sha256()
+    for part in parts:
+        h.update(part.encode("utf-8", errors="ignore") if isinstance(part, str) else part)
+        h.update(b"\x1f")  # unit separator, so "ab"+"c" and "a"+"bc" hash differently
+    return h.hexdigest()
+
+
+async def _ingest_idempotency_check(key: str) -> dict | None:
+    """Return a cached result for `key` if one is still fresh, else None."""
+    async with _ingest_idempotency_lock:
+        now = time.monotonic()
+        _evict_stale_ingest_cache(now)
+        cached = _recent_ingest_results.get(key)
+        return cached[1] if cached is not None else None
+
+
+async def _ingest_idempotency_store(key: str, result: dict) -> None:
+    async with _ingest_idempotency_lock:
+        _recent_ingest_results[key] = (time.monotonic(), result)
+
+
 async def _ingest_bytes(
     filename: str,
     data: bytes,
@@ -1960,6 +1895,17 @@ async def _ingest_bytes(
     ext = _resolve_ext(filename, data)
     if ext not in _INGEST_ACCEPT:
         raise HTTPException(status_code=415, detail=f"Unsupported type '{ext}'")
+
+    idempotency_key = _ingest_idempotency_key(
+        filename, collection, bucket, agent_id, access_level, str(enable_docint), data,
+    )
+    cached = await _ingest_idempotency_check(idempotency_key)
+    if cached is not None:
+        logger.info(
+            "Ingest '%s': duplicate submission within %ds, returning cached result (doc_id=%s)",
+            filename, int(_INGEST_IDEMPOTENCY_TTL_SECONDS), cached.get("document_id"),
+        )
+        return cached
 
     doc_title  = title.strip() or filename
     doc_id     = hashlib.md5(f"{filename}-{datetime.now().isoformat()}".encode()).hexdigest()[:16]
@@ -2068,6 +2014,7 @@ async def _ingest_bytes(
         result_json["docint"] = docint_summary
     if storage_key:
         result_json["storage"] = {"bucket": target_bucket, "key": storage_key}
+    await _ingest_idempotency_store(idempotency_key, result_json)
     return result_json
 
 
@@ -2224,6 +2171,17 @@ async def api_ingest_session(request: Request):
     if not transcript_text:
         raise HTTPException(status_code=422, detail="No text content in messages")
 
+    idempotency_key = _ingest_idempotency_key(
+        session_id, collection, agent_id, access_level, transcript_text,
+    )
+    cached = await _ingest_idempotency_check(idempotency_key)
+    if cached is not None:
+        logger.info(
+            "Ingest session '%s': duplicate submission within %ds, returning cached result (doc_id=%s)",
+            session_id, int(_INGEST_IDEMPOTENCY_TTL_SECONDS), cached.get("document_id"),
+        )
+        return cached
+
     now       = datetime.now(timezone.utc)
     timestamp = now.isoformat()
     file_stamp = now.strftime("%Y-%m-%dT%H-%M-%SZ")
@@ -2277,6 +2235,7 @@ async def api_ingest_session(request: Request):
     }
     if storage_key:
         result["storage"] = {"bucket": S3_BUCKET, "key": storage_key}
+    await _ingest_idempotency_store(idempotency_key, result)
     return result
 
 
@@ -2350,6 +2309,54 @@ async def api_docint(
         },
         "text_preview": result.text[:500],
     }
+
+
+@app.put("/api/external-loader/process")
+async def external_loader_process(request: Request):
+    """OpenWebUI's native file-attach RAG "external" content-extraction-engine
+    contract (see docs/adr/0011-openwebui-native-rag-ocr.md) — a PUT of the
+    raw file bytes, returning {"page_content": ..., "metadata": ...}.
+
+    Without this, OpenWebUI's own built-in file-attach RAG (a completely
+    separate code path from gcor_file_ingest/Graphiti — see ADR 0008) has no
+    OCR capability at all with its default extraction engine: a scanned PDF
+    attached directly to a chat silently extracts to empty content and the
+    assistant reports "I don't see anything attached", independent of
+    gcor_file_ingest's own (already-OCR-capable, per ADR 0009) background
+    archival pipeline succeeding. Reuses the same plain-extraction-first,
+    OCR-only-if-needed logic as /api/ingest.
+
+    Deliberately does NOT run the full DocInt pipeline (tables/forms/
+    classification/entities) — this call is synchronous and blocks the
+    chat response OpenWebUI is building, so it stays to fast local
+    Tesseract OCR only, not multi-second openclaw round-trips.
+    """
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    filename = unquote(request.headers.get("x-filename", "") or "upload")
+    ext = os.path.splitext(filename)[1].lower()
+
+    try:
+        text = _extract_text(filename, data).strip()
+        if not text and ext in {".pdf", ".docx"}:
+            result: DocIntelResult = await process_document(
+                filename, data,
+                extract_tables=False, extract_forms=False,
+                extract_entities=False, classify=False, vision=False,
+            )
+            text = result.text.strip()
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Extraction failed: {exc}")
+
+    if not text:
+        raise HTTPException(status_code=422, detail="No text extracted")
+
+    return JSONResponse(content={
+        "page_content": text,
+        "metadata": {"filename": filename},
+    })
 
 
 @app.get("/health")

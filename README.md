@@ -100,7 +100,9 @@ The MinIO watcher also processes objects placed under `documents/inbox/` (it aut
 
 ## Chat and file capture
 
-Files attached during an Open WebUI chat, and the chat session itself, are captured automatically once the corresponding Function is installed from **Admin Panel > Functions** (see [openwebui-functions/README.md](openwebui-functions/README.md) for install steps):
+This is separate from Open WebUI's own **built-in** file-attach RAG — the "attach a file to a message and ask about it in the same conversation" flow, which needs no Function installed. That path had no OCR capability at all with Open WebUI's default extraction engine, so a scanned PDF/DOCX (no embedded text layer) silently extracted to empty content and the assistant would report nothing was attached — see [docs/adr/0011-openwebui-native-rag-ocr.md](docs/adr/0011-openwebui-native-rag-ocr.md). It's now routed through the proxy's `/api/external-loader/process` (OpenWebUI's own "external" content-extraction-engine contract), which reuses the same OCR-on-empty-extraction logic as `/api/ingest` (see ADR 0009) — fast local Tesseract OCR, not the full Document Intelligence pipeline, since this call is synchronous and blocks the chat response.
+
+Files attached during an Open WebUI chat, and the chat session itself, are *additionally* captured into the durable Graphiti/MinIO knowledge base automatically once the corresponding Function is installed from **Admin Panel > Functions** (see [openwebui-functions/README.md](openwebui-functions/README.md) for install steps) — this is a separate background pipeline from the immediate in-chat RAG above; the two don't share results with each other:
 
 | Function | Captures | Stored at | Indexed into |
 |---|---|---|---|
@@ -132,6 +134,27 @@ Graphiti groups replace Qdrant collections. A group is materialized on first ing
 A `backup` service snapshots FalkorDB and mirrors the MinIO `documents` bucket into `./backups` every `BACKUP_INTERVAL_SECONDS` (default 6h) — see [backup/README.md](backup/README.md) for what's covered, what isn't, and the restore procedure.
 
 `monitoring/alerts.yml` defines Prometheus alert rules (service down, FalkorDB unreachable, elevated LLM/ingest/search error rates) evaluated by the `prometheus` service — check firing alerts at http://localhost:9090/alerts. These are rules only, with no Alertmanager/notification channel wired up yet — see [docs/adr/0007-prometheus-alert-rules.md](docs/adr/0007-prometheus-alert-rules.md).
+
+Every externally-pulled image in `docker-compose.unified.yml` is pinned by digest (`image:tag@sha256:...`), not just a floating tag — a re-pull (fresh clone, `docker compose pull`, a rebuild elsewhere) can't silently land a different image than what was actually tested. See [docs/adr/0014-image-pinning.md](docs/adr/0014-image-pinning.md).
+
+## Testing
+
+```bash
+# CI-gated unit tests (mocked, no live stack needed) — same suite .github/workflows/ci.yml runs
+docker run --rm -v "$(pwd)/proxy:/app" -w /app eedgeai-proxy \
+  python -m unittest tests/test_collection_metadata.py tests/test_governance.py -v
+
+# Live integration tests (needs the stack up, GCOR_API_KEY set) — post-deploy checks, not CI-gated
+docker exec eedgeai-proxy-1 python3 -m unittest tests.test_ingest -v
+```
+
+`.github/workflows/ci.yml` gates every push/PR to `master` on validating `docker-compose.unified.yml`, a syntax check across every tracked `.py` file, the mocked unit suites above (`proxy/tests/`, `openwebui-functions/tests/`), and an informational (non-blocking) report of any image reference missing a digest pin. See [docs/adr/0005-ci-release-gate.md](docs/adr/0005-ci-release-gate.md).
+
+`proxy/tests/test_ingest.py` and `test_openwebui_stream_smoke.py` are deliberately excluded from the CI gate — they need a real running stack (a live Graphiti/FalkorDB, real extraction) rather than mocks, so they're post-deploy checks: run them by hand against a running deployment (`docker exec eedgeai-proxy-1 ...` above) whenever you want to verify ingest → search → delete actually works end-to-end, not just that the code compiles.
+
+## Data governance
+
+Every ingested chunk carries `access_level` (`public` | `restricted` | `agent:<agent_id>`), `confidence`, and `valid_from`/`valid_to`, set at ingestion and enforced at retrieval by `_filter_hits()` in `proxy/main.py`. `proxy/governance.py` is the single source of truth for what a valid `access_level` looks like (`validate_access_level()`) — an invalid or misspelled value is rejected at ingest time rather than silently falling through as public. `valid_from`/`valid_to` are informational only (shown in citations, used as a belief-conflict tiebreaker) — they are not used to hide search results based on wall-clock time; a Graphiti fact whose extracted validity window has passed (e.g. a document reporting on a past quarter) remains permanently searchable, since a fact's own historical period doesn't make it stop being true. See [docs/adr/0004-data-governance-schema.md](docs/adr/0004-data-governance-schema.md) and [docs/adr/0019-search-staleness-was-a-test-fixture-bug.md](docs/adr/0019-search-staleness-was-a-test-fixture-bug.md).
 
 ## Configuration
 

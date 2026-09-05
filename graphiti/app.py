@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import time
@@ -11,9 +12,11 @@ from pydantic import BaseModel, Field
 
 from graphiti_core import Graphiti
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
+from falkordb.asyncio import FalkorDB
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 from graphiti_core.edges import EntityEdge
+from graphiti_core.errors import GroupsEdgesNotFoundError
 from graphiti_core.llm_client.config import LLMConfig
 from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
@@ -48,6 +51,7 @@ from graphiti_core.prompts.summarize_nodes import Summary, SummaryDescription
 # those are runtime-supplied classes, not statically enumerable here. This
 # repo doesn't configure custom entity/edge types by default.
 _graphiti_hotfix_logger = logging.getLogger("graphiti_hotfix")
+logger = logging.getLogger(__name__)
 
 # Per-field overrides where the field's own docstring names a specific
 # fallback more precise than the generic type-based default below.
@@ -207,10 +211,29 @@ def create_graphiti() -> Graphiti:
         )
     )
     reranker = OpenAIRerankerClient(client=llm_client, config=llm_config)
-    driver = FalkorDriver(
+    # FalkorDriver constructs its own falkordb.asyncio.FalkorDB client with
+    # every connection-pool tuning knob left at library defaults —
+    # including health_check_interval=0 (disabled). Found directly: after
+    # this container ran for a while under real ingest/search load, fresh
+    # content stopped being found by /search (proven correct in isolation —
+    # a brand-new Graphiti instance against the same FalkorDB found it
+    # immediately), while a container restart fixed it instantly. That
+    # points at a connection in the pool going stale and never being
+    # detected/replaced, since nothing was ever checking it. Constructing
+    # our own client with health checking enabled and reasonable timeouts,
+    # then handing it to FalkorDriver via falkor_db= (it uses a
+    # caller-provided client as-is instead of building its own) — see
+    # docs/adr/0016-falkordb-connection-health.md.
+    falkor_client = FalkorDB(
         host=os.getenv("FALKORDB_HOST", "falkordb"),
         port=int(os.getenv("FALKORDB_PORT", "6379")),
         password=os.getenv("FALKORDB_PASSWORD") or None,
+        health_check_interval=int(os.getenv("FALKORDB_HEALTH_CHECK_INTERVAL_SECONDS", "30")),
+        socket_timeout=int(os.getenv("FALKORDB_SOCKET_TIMEOUT_SECONDS", "30")),
+        socket_keepalive=True,
+    )
+    driver = FalkorDriver(
+        falkor_db=falkor_client,
         database=os.getenv("FALKORDB_DATABASE", "eedgeai"),
     )
     return Graphiti(
@@ -221,11 +244,50 @@ def create_graphiti() -> Graphiti:
     )
 
 
+SEARCH_RESTART_INTERVAL_SECONDS = int(os.getenv("SEARCH_RESTART_INTERVAL_SECONDS", str(15 * 60)))
+_PROCESS_STARTED_AT = time.monotonic()
+
+
+async def _periodic_self_restart():
+    """Mitigation, not a fix, for docs/adr/0017: /search on this app's
+    long-lived instance intermittently — and sometimes not so
+    intermittently — stopped finding recently-written facts, confirmed
+    correct at every other layer (embedding, storage, the raw Cypher
+    queries, RRF fusion). Every fix attempted in-process (a fresh Graphiti
+    instance per search call, an isolated thread with its own event loop)
+    failed to reliably resolve it; only a genuinely separate OS process
+    ever did, consistently, in every test. A full container restart is
+    the cheapest way to get that same isolation for the app's primary
+    instance too — it's fast (health check passes in well under a
+    minute) and loses no data (FalkorDB is a separate service on its own
+    volume). This trades a small, bounded, and known outage window for an
+    unbounded, unpredictable one — the actual bug still needs a proper
+    upstream fix or root-cause (likely in graphiti-core's or falkordb-py's
+    async client under concurrent load); this just keeps the symptom's
+    damage contained in the meantime. Set
+    SEARCH_RESTART_INTERVAL_SECONDS=0 to disable.
+    """
+    if SEARCH_RESTART_INTERVAL_SECONDS <= 0:
+        return
+    await asyncio.sleep(SEARCH_RESTART_INTERVAL_SECONDS)
+    logger.warning(
+        "Restarting after %ds uptime (SEARCH_RESTART_INTERVAL_SECONDS) — "
+        "see docs/adr/0017-search-connection-workaround.md.",
+        SEARCH_RESTART_INTERVAL_SECONDS,
+    )
+    # os._exit, not sys.exit or a graceful shutdown request: this needs to
+    # actually terminate the process (so `restart: unless-stopped` brings
+    # up a genuinely fresh one) even if something else is hung.
+    os._exit(0)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.graphiti = create_graphiti()
     await app.state.graphiti.build_indices_and_constraints()
+    restart_task = asyncio.create_task(_periodic_self_restart())
     yield
+    restart_task.cancel()
     await app.state.graphiti.close()
 
 
@@ -287,8 +349,141 @@ async def add_messages(request: AddMessagesRequest):
     return {"success": True, "message": "Messages ingested"}
 
 
+def _parse_iso(value) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+async def _diagnose_search_staleness(
+    group_ids: list[str] | None, query: str, returned_edges: list,
+) -> None:
+    """Best-effort diagnostic for docs/adr/0017/0018's still-unresolved
+    search bug. An extensive investigation ruled out module-level caching,
+    event-loop reuse, FalkorDB-wrapper connection pooling, raw FalkorDB
+    write-then-read consistency (instant, verified directly via
+    redis-cli), vector-index lag (none exists), the falkordb client's
+    compact-protocol schema cache (self-heals every call), and a
+    cosine-threshold miss.
+
+    Checks two different, independent things on every search:
+
+    1. **Raw DB-level visibility** (query-independent): for this group's
+       most recently created episode, can this connection see *any* edge
+       sourced from it via a direct MATCH? Ingestion extracts
+       synchronously, so a >30s-old episode with visibly zero edges from
+       it is a genuine connection-staleness signal — the classic ADR 0017
+       shape.
+    2. **Search-level omission** (only meaningful when #1 finds edges, and
+       only checked for an episode created in roughly the last 2 minutes):
+       if the latest episode *does* have edges that this connection can
+       see directly, were any of those specific edge uuids present
+       anywhere in the `search()` call's own actual results? First real
+       capture with this instrumentation live (docs/adr/0018): a test
+       failed exactly this way — the latest episode's edges existed and
+       were confirmed retrievable by a direct MATCH (so #1 didn't fire),
+       yet none of them appeared in `search()`'s output for a query that
+       was directly, strongly relevant to them (cosine ~0.89, matching
+       keywords). That rules out connection staleness for *that*
+       occurrence and points at something inside graphiti-core's own
+       hybrid-search/RRF-fusion path instead.
+
+       CAUGHT A FALSE POSITIVE from this check the same session it shipped:
+       an unrelated real chat query against an old, unrelated "latest
+       episode" — no relevance between query and episode content is ever
+       verified, so without a recency gate this fires on nearly every
+       search in any populated multi-document collection (the group's one
+       "most recent" episode is almost never what an arbitrary later query
+       is actually about). The 2-minute gate keeps this scoped to the
+       actual scenario that matters — search run shortly after its own
+       target content was ingested — where relevance is very likely, not
+       merely possible. Still not proof, just a much better-scoped signal;
+       treat a hit as a lead to investigate, not a confirmed bug.
+
+    Never raises — a failure here must never affect the real response."""
+    try:
+        records, _, _ = await app.state.graphiti.driver.execute_query(
+            "MATCH (ep:Episodic) WHERE ep.group_id IN $group_ids "
+            "WITH ep ORDER BY ep.created_at DESC LIMIT 1 "
+            "OPTIONAL MATCH (:Entity)-[e:RELATES_TO]->(:Entity) "
+            "WHERE ep.uuid IN e.episodes "
+            "RETURN ep.uuid AS episode_uuid, ep.name AS episode_name, "
+            "ep.created_at AS episode_created_at, collect(e.uuid) AS edge_uuids_from_episode",
+            group_ids=group_ids or [],
+        )
+        if not records or not records[0].get("episode_uuid"):
+            return  # group has no episodes at all — nothing to check
+        row = records[0]
+        edge_uuids_from_episode = [u for u in (row.get("edge_uuids_from_episode") or []) if u]
+        uptime_s = time.monotonic() - _PROCESS_STARTED_AT
+        created_at = _parse_iso(row.get("episode_created_at"))
+        age_s = (
+            (datetime.now(timezone.utc) - created_at).total_seconds()
+            if created_at is not None else None
+        )
+
+        if not edge_uuids_from_episode:
+            if age_s is not None and age_s < 30:
+                return  # extraction may legitimately still be in flight
+            logger.warning(
+                "search-staleness suspect (connection-level): this "
+                "connection sees 0 facts sourced from group_ids=%s's most "
+                "recent episode (uuid=%s name=%r created_at=%s age_s=%s), "
+                "even though extraction should be long done. "
+                "process_uptime_s=%.1f search_restart_interval_s=%d — see "
+                "docs/adr/0017.",
+                group_ids, row.get("episode_uuid"), row.get("episode_name"),
+                row.get("episode_created_at"), age_s, uptime_s,
+                SEARCH_RESTART_INTERVAL_SECONDS,
+            )
+            return
+
+        # Data demonstrably exists and is directly visible. Only worth
+        # cross-checking against search()'s own results when the episode
+        # is recent enough that this query is plausibly *about* it —
+        # otherwise "the group's single most-recent episode's facts don't
+        # rank for an unrelated later query" is normal, not a bug (caught
+        # this producing exactly that false positive in real traffic the
+        # same session it shipped, before this gate was added).
+        if age_s is None or age_s >= 120:
+            return
+        returned_uuids = {getattr(edge, "uuid", None) for edge in returned_edges}
+        missing = [u for u in edge_uuids_from_episode if u not in returned_uuids]
+        if missing:
+            logger.warning(
+                "search-ranking suspect, UNVERIFIED relevance (NOT "
+                "connection-level — data is directly visible): "
+                "group_ids=%s's most recent episode (uuid=%s name=%r "
+                "age_s=%.1f) has %d edge(s) confirmed retrievable by a "
+                "direct MATCH, but %d of them did not appear anywhere in "
+                "this search()'s own %d result(s) for query=%r. Worth "
+                "investigating, not confirmed — this query's relevance to "
+                "that episode's content is not verified here. See "
+                "docs/adr/0018. process_uptime_s=%.1f",
+                group_ids, row.get("episode_uuid"), row.get("episode_name"),
+                age_s, len(edge_uuids_from_episode), len(missing),
+                len(returned_edges), query, uptime_s,
+            )
+    except Exception:
+        # Diagnostic-only: never let this check affect the real response,
+        # and don't spam warnings about the check itself failing.
+        logger.debug("search-staleness diagnostic check itself failed", exc_info=True)
+
+
 @app.post("/search")
 async def search(request: SearchQuery):
+    # NOTE: tried several in-process fixes for a real, confirmed bug here
+    # (fresh Graphiti instance per call; an isolated thread with its own
+    # event loop) — neither reliably worked. Only a genuinely separate OS
+    # process ever reliably found recently-written facts in testing. See
+    # docs/adr/0017-search-connection-workaround.md for the full
+    # investigation and why this reverted to the original simple form
+    # rather than keep unproven complexity that added overhead for no
+    # measured benefit. Mitigated instead via a scheduled self-restart
+    # (main() below) that bounds how long any staleness window can last.
     started = time.perf_counter()
     try:
         edges = await app.state.graphiti.search(
@@ -298,6 +493,7 @@ async def search(request: SearchQuery):
         )
         SEARCH_REQUESTS.labels(status="success").inc()
         SEARCH_FACTS.observe(len(edges))
+        await _diagnose_search_staleness(request.group_ids, request.query, edges)
     except Exception:
         SEARCH_REQUESTS.labels(status="error").inc()
         raise
@@ -330,20 +526,108 @@ async def get_episodes(group_id: str, last_n: int = 100):
     return [episode.model_dump(mode="json") for episode in episodes]
 
 
+async def _get_edges_by_group_ids_safe(driver, group_ids: list[str]) -> list[EntityEdge]:
+    """EntityEdge.get_by_group_ids() raises GroupsEdgesNotFoundError instead
+    of returning an empty list when a group has zero edges — a real, live
+    case (e.g. an episode whose extraction produced no facts, or one
+    already fully cleaned up). Every /episode, /admin/gc-orphaned-edges,
+    and /group delete path below needs "no edges" to mean "nothing to do",
+    not a 500. Hit this repeatedly on real test episodes before fixing it
+    here rather than working around it at each call site again."""
+    try:
+        return await EntityEdge.get_by_group_ids(driver, group_ids)
+    except GroupsEdgesNotFoundError:
+        return []
+
+
 @app.delete("/episode/{episode_uuid}")
 async def delete_episode(episode_uuid: str):
+    """Delete one episode AND the facts (EntityEdge) it's the sole source
+    of. Previously deleted only the episode node — the edges Graphiti
+    extracted from it survived untouched and stayed fully searchable
+    forever, permanently orphaned from any source. Found directly: a test
+    document deleted via this endpoint (200, "success": true) still had
+    its extracted facts showing up in unrelated /api/search results with
+    real graphiti_edge_uuids, long after its episode was gone from
+    /episodes/{group}'s listing. See docs/adr/0015.
+
+    An edge can be corroborated by multiple episodes (EntityEdge.episodes)
+    — e.g. the same fact re-confirmed across several ingested documents.
+    Deleting the whole edge over one contributing episode being removed
+    would destroy evidence still backed by the others still present, so:
+    strip just this episode's uuid from an edge's `episodes` list if
+    others remain; only delete the edge outright if this was its sole
+    source.
+    """
     try:
         episode = await EpisodicNode.get_by_uuid(app.state.graphiti.driver, episode_uuid)
-        await episode.delete(app.state.graphiti.driver)
     except Exception as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {"success": True}
+
+    edges = await _get_edges_by_group_ids_safe(app.state.graphiti.driver, [episode.group_id])
+    edges_deleted = 0
+    edges_updated = 0
+    for edge in edges:
+        if episode_uuid not in (edge.episodes or []):
+            continue
+        remaining = [e for e in edge.episodes if e != episode_uuid]
+        if remaining:
+            edge.episodes = remaining
+            await edge.save(app.state.graphiti.driver)
+            edges_updated += 1
+        else:
+            await edge.delete(app.state.graphiti.driver)
+            edges_deleted += 1
+
+    await episode.delete(app.state.graphiti.driver)
+    return {"success": True, "edges_deleted": edges_deleted, "edges_updated": edges_updated}
+
+
+@app.post("/admin/gc-orphaned-edges/{group_id}")
+async def gc_orphaned_edges(group_id: str):
+    """One-time (or periodic) cleanup for edges left orphaned by
+    delete_episode()'s bug prior to this fix — it used to delete only the
+    episode node, leaving every edge it produced permanently searchable
+    with no surviving source. Any deployment that ever called single-doc
+    delete before this fix landed has this debt; this endpoint pays it
+    off without needing to know which episode_uuids were ever deleted.
+
+    For every edge in the group: keep only the episode uuids that still
+    exist; delete the edge if none remain, update it if the list changed
+    but isn't empty, leave it untouched otherwise. Safe to run repeatedly
+    — a clean group does no writes.
+    """
+    edges = await _get_edges_by_group_ids_safe(app.state.graphiti.driver, [group_id])
+    episodes = await EpisodicNode.get_by_group_ids(app.state.graphiti.driver, [group_id])
+    live_episode_uuids = {e.uuid for e in episodes}
+
+    edges_deleted = 0
+    edges_updated = 0
+    edges_scanned = len(edges)
+    for edge in edges:
+        current = edge.episodes or []
+        remaining = [e for e in current if e in live_episode_uuids]
+        if len(remaining) == len(current):
+            continue  # nothing orphaned on this edge
+        if remaining:
+            edge.episodes = remaining
+            await edge.save(app.state.graphiti.driver)
+            edges_updated += 1
+        else:
+            await edge.delete(app.state.graphiti.driver)
+            edges_deleted += 1
+
+    return {
+        "success": True, "group_id": group_id,
+        "edges_scanned": edges_scanned,
+        "edges_deleted": edges_deleted, "edges_updated": edges_updated,
+    }
 
 
 @app.delete("/group/{group_id}")
 async def delete_group(group_id: str):
     episodes = await EpisodicNode.get_by_group_ids(app.state.graphiti.driver, [group_id])
-    edges = await EntityEdge.get_by_group_ids(app.state.graphiti.driver, [group_id])
+    edges = await _get_edges_by_group_ids_safe(app.state.graphiti.driver, [group_id])
     for edge in edges:
         await edge.delete(app.state.graphiti.driver)
     for episode in episodes:

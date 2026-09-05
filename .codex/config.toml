@@ -1,0 +1,9 @@
+[mcp_servers.Lokka-Microsoft]
+command = "npx"
+args = [
+    "-y",
+    "@merill/lokka",
+]
+
+[mcp_servers.claude-code-docs]
+url = "https://code.claude.com/docs/mcp"
