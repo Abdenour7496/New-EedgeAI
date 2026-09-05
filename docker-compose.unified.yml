@@ -3,7 +3,7 @@ services:
   # ── Data stores ───────────────────────────────────────────────────────────────
 
   falkordb:
-    image: falkordb/falkordb:latest@sha256:05b3645c78c881a967c7d6b6ab4a8a2f461caf42962d38274aa116658195ad3d
+    image: falkordb/falkordb:latest@sha256:adbddd418916c25618564ff8597a919b08bc76452ebeb74eb985c38d7281df62
     # Bound to localhost only: this is the graph/vector store, not a public
     # surface — other containers reach it over the docker network by service
     # name regardless of host port bindings. Reach it from the host itself via
@@ -113,7 +113,7 @@ services:
           memory: 4g
 
   graphiti-mcp:
-    image: zepai/knowledge-graph-mcp:standalone@sha256:460bafb39439d99ff001ea6ef03efbe0bd5d9e6afe2655edf926da4fd9df97c5
+    image: zepai/knowledge-graph-mcp:standalone@sha256:52d619bc3c45527dd5e6c5c413f3024f50d79fa672c81f4b384eb04bff85ca84
     environment:
       CONFIG_PATH: /app/mcp/config/config.yaml
       OPENAI_API_URL: ${GRAPHITI_API_BASE_URL:-http://ollama:11434/v1}
@@ -151,7 +151,7 @@ services:
   # allowlist accepts (see graphiti-mcp/nginx.conf) — OpenClaw talks to this,
   # not to graphiti-mcp directly.
   graphiti-mcp-proxy:
-    image: nginx:alpine@sha256:db35bfc6b2951e7f8a72db5db120288c127ffaeeb4a6d4b95a26fead017d5913
+    image: nginx:alpine@sha256:72ba65eb42c10344912a84ff42408db7d34f2feb642204570ab8fc5ffd29f1d3
     volumes:
       - ./graphiti-mcp/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
@@ -168,7 +168,7 @@ services:
   # ── Ollama (local LLM) ────────────────────────────────────────────────────────
 
   ollama:
-    image: ollama/ollama:latest@sha256:9d30908e41144b1f1da89b9d8e33c07e4aeb43ff41a8660241b1686e2cc330ad
+    image: ollama/ollama:latest@sha256:32931b46719f673c05fdbaa81ccb26da18ea4a1c57590a754874ab28ba269eb2
     ports:
       - "127.0.0.1:11434:11434"
     volumes:
@@ -199,7 +199,7 @@ services:
           memory: 12g
 
   ollama-init:
-    image: ollama/ollama:latest@sha256:9d30908e41144b1f1da89b9d8e33c07e4aeb43ff41a8660241b1686e2cc330ad
+    image: ollama/ollama:latest@sha256:32931b46719f673c05fdbaa81ccb26da18ea4a1c57590a754874ab28ba269eb2
     depends_on:
       ollama:
         condition: service_healthy
@@ -215,7 +215,7 @@ services:
     restart: "no"
 
   openclaw-config-init:
-    image: alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+    image: alpine:latest@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
     command:
       - /bin/sh
       - -lc
@@ -249,6 +249,10 @@ services:
       - "127.0.0.1:18801:18801"
       - "127.0.0.1:9091:9091"
     environment:
+      # OpenClaw 2026.9+ only auto-discovers a project-local managed Codex
+      # package. This image installs Codex globally, so point the Codex bridge
+      # at the verified global launcher explicitly.
+      OPENCLAW_CODEX_APP_SERVER_BIN: /usr/local/bin/codex
       # Deliberately NOT set here (unlike the proxy service, which has its own
       # copy for RAG/vision calls): the bundled `claude` CLI prefers
       # ANTHROPIC_API_KEY over an OAuth/subscription login whenever it's
@@ -481,7 +485,7 @@ services:
   # ── OpenWebUI ─────────────────────────────────────────────────────────────────
 
   openwebui:
-    image: ghcr.io/open-webui/open-webui:v0.11.1@sha256:6bb1fbe8ab0a3e0456067f493044ffb66a30a65a34be47f6a5862176a370dd16
+    image: ghcr.io/open-webui/open-webui:latest@sha256:8afd2d774834c618a75411b3491cdc5da7396dc464f56a160b937ff2992eb6e4
     # No longer the public port — `caddy` below is now the TLS front door end
     # users hit (see docs/adr/0006-tls-reverse-proxy.md). Bound to localhost
     # only, same as every other admin/operator surface in this stack; reach
@@ -579,7 +583,7 @@ services:
   # have a real certificate — see the ADR for swapping one in.
 
   caddy:
-    image: caddy:2.8-alpine@sha256:af32e97399febea808609119bb21544d0265c58a02836576e32a2d082c262c17
+    image: caddy:alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
     ports:
       - "8443:8443"
     volumes:
@@ -605,7 +609,7 @@ services:
   # ── Monitoring ────────────────────────────────────────────────────────────────
 
   falkordb-exporter:
-    image: oliver006/redis_exporter:latest@sha256:fed773ffd2bb2eac706e0ed9cc2fff41651193ee4977e2a4f6919658ad2313f4
+    image: oliver006/redis_exporter:latest@sha256:a129504e65b87c54f79bc92f1afc403475e8ff646a3d7512de469904ceddf986
     environment:
       REDIS_ADDR: redis://falkordb:6379
       REDIS_PASSWORD: ${FALKORDB_PASSWORD:-}
@@ -634,7 +638,7 @@ services:
           memory: 1g
 
   grafana:
-    image: grafana/grafana@sha256:3fd54ae1214669f8355f065ec9f6445d5279a3d77095ab048ca045685272429b
+    image: grafana/grafana:latest@sha256:f772d434e8fab0049deb2b1b30abd43342bcfca1537614aa8d36080232cf4283
     ports:
       - "127.0.0.1:3000:3000"
     environment:

@@ -1,4 +1,4 @@
-FROM alpine:3.20
+FROM alpine:latest@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 
 # redis-cli (FalkorDB is redis-protocol-compatible) + bash + curl for the mc
 # download below. mc (MinIO client) isn't packaged for Alpine, so it's pulled
